@@ -1,74 +1,15 @@
 import logging
 from pathlib import Path
 from typing import List
-import re
 
 from llama_index.core import Document, SimpleDirectoryReader
-from llama_index.core.node_parser import SentenceSplitter
 
 from rag.embeddings import embed_texts
 from rag.exceptions import IngestionError, EmbeddingError, StorageError
 from rag.vector_store import get_vector_store
+from ingestion.chunking import smart_chunk_documents
 
 logger = logging.getLogger(__name__)
-
-
-def detect_and_format_tables(text: str) -> str:
-    """
-    Phát hiện và format lại dữ liệu dạng bảng trong text.
-    Tìm các pattern như: nhiều dòng có cùng số cột, dữ liệu có tab/space phân cách.
-    """
-    lines = text.split('\n')
-    table_candidates = []
-    current_table = []
-    
-    for line in lines:
-        # Phát hiện dòng có nhiều cột (tab, pipe, hoặc nhiều space)
-        parts = re.split(r'\t|\|', line.strip())
-        if len(parts) >= 2 and any(part.strip() for part in parts):
-            # Có thể là hàng của bảng
-            if not current_table:
-                current_table = [line]
-            else:
-                # Kiểm tra số cột có khớp không
-                prev_parts = re.split(r'\t|\|', current_table[-1].strip())
-                if len(parts) == len(prev_parts):
-                    current_table.append(line)
-                else:
-                    # Kết thúc bảng hiện tại
-                    if len(current_table) >= 2:
-                        table_candidates.append(current_table)
-                    current_table = [line] if len(parts) >= 2 else []
-        else:
-            if current_table and len(current_table) >= 2:
-                table_candidates.append(current_table)
-            current_table = []
-    
-    if current_table and len(current_table) >= 2:
-        table_candidates.append(current_table)
-    
-    # Format lại thành markdown table
-    result = text
-    for table in table_candidates:
-        original = '\n'.join(table)
-        # Chuyển thành markdown table
-        formatted_rows = []
-        for i, row in enumerate(table):
-            parts = re.split(r'\t|\|', row.strip())
-            parts = [p.strip() for p in parts if p.strip()]
-            if parts:
-                formatted_row = '| ' + ' | '.join(parts) + ' |'
-                formatted_rows.append(formatted_row)
-                if i == 0:
-                    # Thêm separator
-                    separator = '| ' + ' | '.join(['---'] * len(parts)) + ' |'
-                    formatted_rows.append(separator)
-        
-        if formatted_rows:
-            formatted_table = '\n'.join(formatted_rows)
-            result = result.replace(original, f"\n\n{formatted_table}\n\n")
-    
-    return result
 
 
 def load_documents(folder_path: str) -> List[Document]:
@@ -79,17 +20,11 @@ def load_documents(folder_path: str) -> List[Document]:
 
 
 def preprocess_and_chunk(documents: List[Document]):
-    """Clean and chunk documents into nodes."""
-    splitter = SentenceSplitter(chunk_size=1000, chunk_overlap=100)
-    nodes = splitter.get_nodes_from_documents(documents)
-    
-    # Xử lý và format tables trong mỗi node
-    for node in nodes:
-        content = node.get_content()
-        formatted_content = detect_and_format_tables(content)
-        node.set_content(formatted_content)
-    
-    return nodes
+    """
+    Clean and chunk documents into nodes using smart chunking strategy.
+    Preserves document structure (headers, lists, code blocks, tables).
+    """
+    return smart_chunk_documents(documents)
 
 
 def run_ingestion(folder_path: str) -> int:
