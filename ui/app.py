@@ -11,6 +11,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
 from ingestion.pipeline import run_ingestion
+from rag.exceptions import RAGAgentException
 from rag.pipeline import answer_query
 from rag.vector_store import get_vector_store
 from storage.conversation_store import get_conversation_store
@@ -104,7 +105,10 @@ def sidebar_conversations():
         else:
             st.sidebar.info("Chưa có cuộc trò chuyện nào.")
     except Exception as e:
-        st.sidebar.error(f"Lỗi khi tải danh sách cuộc trò chuyện: {str(e)}")
+        st.sidebar.error(
+            "⚠️ Không thể tải danh sách cuộc trò chuyện. "
+            "Vui lòng làm mới trang hoặc thử lại sau."
+        )
 
 
 def sidebar_ingestion():
@@ -115,15 +119,23 @@ def sidebar_ingestion():
 
     if st.sidebar.button("Ingest tài liệu") and uploaded_files:
         with st.spinner("Đang lưu file và ingest vào vector store..."):
-            folder = save_uploaded_files(uploaded_files)
-            count = run_ingestion(folder)
-        st.sidebar.success(f"Ingest xong {count} chunks từ thư mục tạm.")
-        # Clear cache to refresh document list
-        if hasattr(st.session_state, 'ingested_docs_cache'):
-            del st.session_state.ingested_docs_cache
-        # Clear selected documents
-        if 'selected_documents' in st.session_state:
-            st.session_state.selected_documents = []
+            try:
+                folder = save_uploaded_files(uploaded_files)
+                count = run_ingestion(folder)
+                st.sidebar.success(f"Ingest xong {count} chunks từ thư mục tạm.")
+                # Clear cache to refresh document list
+                if hasattr(st.session_state, 'ingested_docs_cache'):
+                    del st.session_state.ingested_docs_cache
+                # Clear selected documents
+                if 'selected_documents' in st.session_state:
+                    st.session_state.selected_documents = []
+            except RAGAgentException as e:
+                st.sidebar.error(f"⚠️ {e.user_message}")
+            except Exception as e:
+                st.sidebar.error(
+                    "⚠️ Đã xảy ra lỗi khi xử lý tài liệu. "
+                    "Vui lòng kiểm tra định dạng file và thử lại."
+                )
     
     # Display ingested documents
     st.sidebar.divider()
@@ -285,7 +297,10 @@ def sidebar_ingestion():
         else:
             st.sidebar.info("Chưa có tài liệu nào được ingest.")
     except Exception as e:
-        st.sidebar.error(f"Lỗi khi tải danh sách tài liệu: {str(e)}")
+        st.sidebar.error(
+            "⚠️ Không thể tải danh sách tài liệu. "
+            "Vui lòng làm mới trang hoặc thử lại sau."
+        )
     
     # View document details modal/expander
     if st.session_state.get('view_document'):
@@ -321,7 +336,10 @@ def sidebar_ingestion():
                 st.session_state.view_document = None
                 st.rerun()
         except Exception as e:
-            st.sidebar.error(f"Lỗi khi tải chi tiết: {str(e)}")
+            st.sidebar.error(
+                "⚠️ Không thể tải chi tiết tài liệu. "
+                "Vui lòng thử lại sau."
+            )
             if st.sidebar.button("✖️ Đóng", key="close_view_error"):
                 st.session_state.view_document = None
                 st.rerun()
@@ -392,18 +410,44 @@ def main_chat():
                         conversation_id=conversation_id,
                         use_history=st.session_state.use_history,
                     )
-                except Exception as e:
-                    error_msg = f"Lỗi: {str(e)}"
-                    st.error(error_msg)
+                except RAGAgentException as e:
+                    # Use user-friendly message from custom exception
+                    error_msg = e.user_message
+                    st.error(f"⚠️ {error_msg}")
                     st.session_state.messages.append(
-                        {"role": "assistant", "content": error_msg}
+                        {"role": "assistant", "content": f"⚠️ {error_msg}"}
                     )
                     # Save error message to DB
-                    store.add_message(
-                        conversation_id=conversation_id,
-                        role="assistant",
-                        content=error_msg,
+                    try:
+                        store.add_message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=f"⚠️ {error_msg}",
+                        )
+                    except Exception:
+                        # If we can't save, just log it
+                        pass
+                    return
+                except Exception as e:
+                    # Fallback for unexpected errors
+                    error_msg = (
+                        "Đã xảy ra lỗi không mong đợi khi xử lý câu hỏi của bạn. "
+                        "Vui lòng thử lại sau hoặc liên hệ quản trị viên nếu vấn đề tiếp tục."
                     )
+                    st.error(f"⚠️ {error_msg}")
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": f"⚠️ {error_msg}"}
+                    )
+                    # Save error message to DB
+                    try:
+                        store.add_message(
+                            conversation_id=conversation_id,
+                            role="assistant",
+                            content=f"⚠️ {error_msg}",
+                        )
+                    except Exception:
+                        # If we can't save, just log it
+                        pass
                     return
 
             # Display answer

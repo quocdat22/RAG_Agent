@@ -1,11 +1,15 @@
 import logging
+import time
 from typing import List, Optional
 
 from azure.ai.inference import ChatCompletionsClient
 from azure.core.credentials import AzureKeyCredential
 
 from config.settings import get_settings
+from rag.exceptions import ConfigurationError, LLMError
+from rag.logging_utils import log_api_call
 from rag.prompts import SYSTEM_PROMPT
+from rag.retry_utils import retry_with_backoff, is_retryable_error
 
 logger = logging.getLogger(__name__)
 
@@ -39,9 +43,26 @@ def _get_client_and_model() -> tuple[ChatCompletionsClient, str]:
         )
         return client, settings.github_chat_model
 
-    raise RuntimeError(
+    raise ConfigurationError(
         "No chat model provider configured. "
-        "Set either Azure OpenAI envs or GITHUB_TOKEN for GitHub Models."
+        "Set either Azure OpenAI envs or GITHUB_TOKEN for GitHub Models.",
+        user_message="Cấu hình dịch vụ AI chưa được thiết lập. Vui lòng liên hệ quản trị viên."
+    )
+
+
+@retry_with_backoff(
+    max_retries=3,
+    initial_delay=1.0,
+    max_delay=30.0,
+    exponential_base=2.0,
+)
+def _call_llm_api(client: ChatCompletionsClient, model_name: str, messages: List[dict]):
+    """
+    Internal function to call LLM API with retry logic.
+    """
+    return client.complete(
+        model=model_name,
+        messages=messages,
     )
 
 
@@ -50,10 +71,27 @@ def generate_answer(
     context_chunks: List[str],
     conversation_history: Optional[List[dict]] = None,
 ) -> str:
+    """
+    Generate answer using LLM with improved error handling and logging.
+    
+    Raises:
+        LLMError: If LLM API call fails after retries
+        ConfigurationError: If LLM is not configured
+    """
     if not context_chunks:
         return "Không tìm thấy trong tài liệu nội bộ."
 
-    client, model_name = _get_client_and_model()
+    start_time = time.time()
+    
+    try:
+        client, model_name = _get_client_and_model()
+    except ConfigurationError:
+        raise
+    except Exception as e:
+        raise ConfigurationError(
+            f"Failed to initialize LLM client: {str(e)}",
+            user_message="Không thể khởi tạo dịch vụ AI. Vui lòng kiểm tra cấu hình."
+        ) from e
 
     context_joined = "\n\n---\n\n".join(context_chunks)
     user_content = (
@@ -87,20 +125,42 @@ def generate_answer(
     # Add current query with context
     messages.append({"role": "user", "content": user_content})
 
+    # Prepare request data for logging (sanitize sensitive info)
+    request_data = {
+        "model": model_name,
+        "message_count": len(messages),
+        "query_length": len(query),
+        "context_chunks_count": len(context_chunks),
+        "has_history": bool(conversation_history),
+    }
+
     try:
-        resp = client.complete(
-            model=model_name,
-            messages=messages,
+        # Call LLM API with retry logic
+        resp = _call_llm_api(client, model_name, messages)
+        duration_ms = (time.time() - start_time) * 1000
+
+        # Log successful API call
+        log_api_call(
+            service_name="LLM",
+            request_data=request_data,
+            response_data={
+                "has_response": resp is not None,
+                "choices_count": len(resp.choices) if resp and hasattr(resp, "choices") else 0,
+            },
+            duration_ms=duration_ms,
         )
 
         choice = resp.choices[0]
         if not choice or not choice.message:
             logger.error("No message in response choice")
-            return "Lỗi: Không nhận được response từ LLM."
+            raise LLMError(
+                "No message in response choice",
+                user_message="Không nhận được phản hồi từ dịch vụ AI. Vui lòng thử lại."
+            )
 
         # Handle different response structures
         content = choice.message.content
-        logger.debug(f"Response content type: {type(content)}, content: {content}")
+        logger.debug(f"Response content type: {type(content)}")
         
         # Case 1: content is a string directly
         if isinstance(content, str):
@@ -130,14 +190,58 @@ def generate_answer(
                 return "".join(text_parts)
             else:
                 logger.warning(f"Could not extract text from content list: {content}")
+                raise LLMError(
+                    f"Could not extract text from content list: {type(content)}",
+                    user_message="Không thể xử lý phản hồi từ dịch vụ AI. Vui lòng thử lại."
+                )
         
         # Fallback: try to convert to string
-        result = str(content) if content else "Lỗi: Response rỗng từ LLM."
-        logger.warning(f"Using fallback string conversion: {result}")
+        result = str(content) if content else None
+        if not result:
+            raise LLMError(
+                "Empty response from LLM",
+                user_message="Nhận được phản hồi rỗng từ dịch vụ AI. Vui lòng thử lại."
+            )
+        
+        logger.warning(f"Using fallback string conversion: {result[:100]}...")
         return result
     
+    except LLMError:
+        # Re-raise LLMError as-is
+        raise
+    except ConfigurationError:
+        # Re-raise ConfigurationError as-is
+        raise
     except Exception as e:
-        logger.exception("Error calling LLM")
-        return f"Lỗi khi gọi LLM: {str(e)}"
+        duration_ms = (time.time() - start_time) * 1000
+        
+        # Log failed API call
+        log_api_call(
+            service_name="LLM",
+            request_data=request_data,
+            duration_ms=duration_ms,
+            error=e,
+        )
+        
+        # Determine if error is retryable
+        if is_retryable_error(e):
+            raise LLMError(
+                f"LLM API call failed after retries: {str(e)}",
+                user_message=(
+                    "Không thể kết nối với dịch vụ AI sau nhiều lần thử. "
+                    "Có thể do vấn đề mạng hoặc dịch vụ tạm thời không khả dụng. "
+                    "Vui lòng thử lại sau vài phút."
+                ),
+                details={"error_type": type(e).__name__, "retryable": True}
+            ) from e
+        else:
+            raise LLMError(
+                f"LLM API call failed: {str(e)}",
+                user_message=(
+                    "Lỗi khi gọi dịch vụ AI. "
+                    "Vui lòng kiểm tra lại câu hỏi hoặc liên hệ quản trị viên nếu vấn đề tiếp tục."
+                ),
+                details={"error_type": type(e).__name__, "retryable": False}
+            ) from e
 
 

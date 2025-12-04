@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import List
 import re
@@ -6,7 +7,10 @@ from llama_index.core import Document, SimpleDirectoryReader
 from llama_index.core.node_parser import SentenceSplitter
 
 from rag.embeddings import embed_texts
+from rag.exceptions import IngestionError, EmbeddingError, StorageError
 from rag.vector_store import get_vector_store
+
+logger = logging.getLogger(__name__)
 
 
 def detect_and_format_tables(text: str) -> str:
@@ -97,16 +101,43 @@ def run_ingestion(folder_path: str) -> int:
     - store in Chroma
 
     Returns number of chunks inserted.
+    
+    Raises:
+        IngestionError: If ingestion fails at any step
     """
     path = Path(folder_path)
     if not path.exists() or not path.is_dir():
-        raise ValueError(f"Folder not found: {folder_path}")
+        raise IngestionError(
+            f"Folder not found: {folder_path}",
+            user_message=f"Không tìm thấy thư mục: {folder_path}. Vui lòng kiểm tra đường dẫn."
+        )
 
-    documents = load_documents(folder_path)
+    try:
+        documents = load_documents(folder_path)
+    except Exception as e:
+        logger.error(f"Failed to load documents: {str(e)}", exc_info=True)
+        raise IngestionError(
+            f"Failed to load documents: {str(e)}",
+            user_message=(
+                "Không thể đọc tài liệu từ thư mục. "
+                "Vui lòng kiểm tra định dạng file được hỗ trợ (PDF, DOCX, XLSX, HTML, MD, TXT)."
+            ),
+            details={"error_type": type(e).__name__}
+        ) from e
+
     if not documents:
+        logger.warning(f"No documents found in folder: {folder_path}")
         return 0
 
-    nodes = preprocess_and_chunk(documents)
+    try:
+        nodes = preprocess_and_chunk(documents)
+    except Exception as e:
+        logger.error(f"Failed to preprocess documents: {str(e)}", exc_info=True)
+        raise IngestionError(
+            f"Failed to preprocess documents: {str(e)}",
+            user_message="Không thể xử lý tài liệu. Vui lòng kiểm tra định dạng file và thử lại."
+        ) from e
+
     texts = [n.get_content() for n in nodes]
     metadatas = []
     
@@ -123,11 +154,46 @@ def run_ingestion(folder_path: str) -> int:
             )
         metadatas.append(metadata)
 
-    embeddings = embed_texts(texts)
+    try:
+        embeddings = embed_texts(texts)
+    except EmbeddingError:
+        # Re-raise EmbeddingError as-is
+        raise
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings: {str(e)}", exc_info=True)
+        raise IngestionError(
+            f"Failed to generate embeddings: {str(e)}",
+            user_message=(
+                "Không thể tạo embedding cho tài liệu. "
+                "Có thể do lỗi kết nối dịch vụ embedding. Vui lòng thử lại sau."
+            ),
+            details={"error_type": type(e).__name__}
+        ) from e
 
-    vs = get_vector_store()
-    vs.add_documents(texts=texts, metadatas=metadatas, embeddings=embeddings)
+    if len(embeddings) != len(texts):
+        logger.error(
+            f"Embedding count mismatch: {len(texts)} texts but {len(embeddings)} embeddings"
+        )
+        raise IngestionError(
+            f"Embedding count mismatch: {len(texts)} texts but {len(embeddings)} embeddings",
+            user_message="Lỗi khi tạo embedding. Vui lòng thử lại."
+        )
 
+    try:
+        vs = get_vector_store()
+        vs.add_documents(texts=texts, metadatas=metadatas, embeddings=embeddings)
+    except Exception as e:
+        logger.error(f"Failed to store documents: {str(e)}", exc_info=True)
+        raise IngestionError(
+            f"Failed to store documents: {str(e)}",
+            user_message=(
+                "Không thể lưu tài liệu vào cơ sở dữ liệu. "
+                "Vui lòng kiểm tra kết nối và thử lại."
+            ),
+            details={"error_type": type(e).__name__}
+        ) from e
+
+    logger.info(f"Successfully ingested {len(nodes)} chunks from {folder_path}")
     return len(nodes)
 
 
