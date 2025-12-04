@@ -15,19 +15,16 @@ from llama_index.core.node_parser import (
 )
 from llama_index.core.schema import BaseNode, TextNode
 
+from ingestion.metadata_schema import normalize_metadata, get_file_path, MetadataFields
+
 logger = logging.getLogger(__name__)
 
 
 def detect_document_type(document: Document) -> str:
     """Detect document type based on file extension and content."""
     metadata = document.metadata or {}
-    file_path = (
-        metadata.get("file_path") or 
-        metadata.get("file_name") or 
-        metadata.get("filename") or 
-        metadata.get("source") or 
-        ""
-    )
+    # Use normalized metadata helper
+    file_path = get_file_path(metadata)
     
     if not file_path:
         # Try to detect from content
@@ -184,28 +181,30 @@ def preserve_structure_in_metadata(node: BaseNode, document: Document) -> BaseNo
     tables = detect_tables(content)
     headers = detect_headers(content)
     
-    # Update metadata
-    metadata = node.metadata or {}
+    # Normalize existing metadata first
+    raw_metadata = node.metadata or {}
+    metadata = normalize_metadata(raw_metadata)
     
+    # Add structure information using standard field names
     if code_blocks:
-        metadata["has_code"] = True
-        metadata["code_block_count"] = len(code_blocks)
+        metadata[MetadataFields.HAS_CODE] = True
+        metadata[MetadataFields.CODE_BLOCK_COUNT] = len(code_blocks)
     
     if tables:
-        metadata["has_table"] = True
-        metadata["table_count"] = len(tables)
+        metadata[MetadataFields.HAS_TABLE] = True
+        metadata[MetadataFields.TABLE_COUNT] = len(tables)
     
     if headers:
-        metadata["has_headers"] = True
-        metadata["header_count"] = len(headers)
+        metadata[MetadataFields.HAS_HEADERS] = True
+        metadata[MetadataFields.HEADER_COUNT] = len(headers)
         # Include header hierarchy
         header_titles = [h["title"] for h in headers[:3]]  # First 3 headers
-        metadata["section_headers"] = " > ".join(header_titles)
+        metadata[MetadataFields.SECTION_HEADERS] = " > ".join(header_titles)
     
     # Detect lists
     list_pattern = r'^[\s]*[-*+]\s+|^[\s]*\d+\.\s+'
     if re.search(list_pattern, content, re.MULTILINE):
-        metadata["has_list"] = True
+        metadata[MetadataFields.HAS_LIST] = True
     
     node.metadata = metadata
     return node
@@ -249,7 +248,7 @@ def chunk_code_document(document: Document, language: Optional[str] = None) -> L
             # Add language info
             if language:
                 node.metadata = node.metadata or {}
-                node.metadata["code_language"] = language
+                node.metadata[MetadataFields.CODE_LANGUAGE] = language
             processed_nodes.append(node)
         
         logger.info(f"Chunked code document into {len(processed_nodes)} nodes")
@@ -323,9 +322,11 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
         
         # Add PDF-specific metadata
         node.metadata = node.metadata or {}
-        node.metadata["document_type"] = "pdf"
-        if document.metadata.get("page_label"):
-            node.metadata["page"] = document.metadata.get("page_label")
+        node.metadata[MetadataFields.DOCUMENT_TYPE] = "pdf"
+        # Normalize page field
+        page_value = document.metadata.get("page_label") or document.metadata.get("page")
+        if page_value:
+            node.metadata[MetadataFields.PAGE] = str(page_value)
         
         processed_nodes.append(node)
     
@@ -435,14 +436,18 @@ def smart_chunk_documents(documents: List[Document]) -> List[BaseNode]:
                 nodes = chunk_with_sentence_splitter(doc, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
             
             # Ensure all nodes have proper metadata
-            for node in nodes:
-                node.metadata = node.metadata or {}
-                node.metadata["document_type"] = doc_type
-                # Preserve original document metadata
+            for idx, node in enumerate(nodes):
+                raw_metadata = node.metadata or {}
+                # Normalize metadata
+                normalized_metadata = normalize_metadata(raw_metadata)
+                normalized_metadata[MetadataFields.DOCUMENT_TYPE] = doc_type
+                # Preserve original document metadata (will be normalized)
                 if doc.metadata:
-                    for key, value in doc.metadata.items():
-                        if key not in node.metadata:
-                            node.metadata[key] = value
+                    doc_metadata_normalized = normalize_metadata(doc.metadata)
+                    for key, value in doc_metadata_normalized.items():
+                        if key not in normalized_metadata:
+                            normalized_metadata[key] = value
+                node.metadata = normalized_metadata
             
             all_nodes.extend(nodes)
             

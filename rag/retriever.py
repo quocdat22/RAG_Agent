@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from rag.embeddings import embed_texts
 from rag.sparse_index import SparseIndex
 from rag.vector_store import get_collection
+from ingestion.metadata_schema import normalize_metadata, MetadataFields
 
 
 @dataclass
@@ -22,11 +23,11 @@ def dense_retrieve(
     [query_emb] = embed_texts([query])
     where = None
     if allowed_file_paths:
-        # Normalize where clause based on number of documents
+        # Use normalized file_path field for consistent querying
         if len(allowed_file_paths) == 1:
-            where = {"file_path": allowed_file_paths[0]}
+            where = {MetadataFields.FILE_PATH: allowed_file_paths[0]}
         else:
-            where = {"file_path": {"$in": allowed_file_paths}}
+            where = {MetadataFields.FILE_PATH: {"$in": allowed_file_paths}}
 
     res = collection.query(
         query_embeddings=[query_emb],
@@ -38,8 +39,13 @@ def dense_retrieve(
     metas = res.get("metadatas", [[]])[0]
     dists = res.get("distances", [[]])[0] or [0.0] * len(docs)
 
+    # Normalize metadata in results for consistency
     return [
-        CandidateChunk(text=doc, metadata=meta or {}, score=float(-dist))
+        CandidateChunk(
+            text=doc, 
+            metadata=normalize_metadata(meta or {}), 
+            score=float(-dist)
+        )
         for doc, meta, dist in zip(docs, metas, dists)
     ]
 
@@ -47,10 +53,11 @@ def dense_retrieve(
 def sparse_retrieve(query: str, all_texts: List[str], all_metadatas: List[Dict[str, Any]], k: int = 20) -> List[CandidateChunk]:
     index = SparseIndex(all_texts)
     top_idx = index.search(query, k=k)
+    # Normalize metadata for consistency
     return [
         CandidateChunk(
             text=all_texts[i],
-            metadata=all_metadatas[i] if i < len(all_metadatas) else {},
+            metadata=normalize_metadata(all_metadatas[i] if i < len(all_metadatas) else {}),
             score=float(k - rank),
         )
         for rank, i in enumerate(top_idx)

@@ -8,6 +8,7 @@ from rag.embeddings import embed_texts
 from rag.exceptions import IngestionError, EmbeddingError, StorageError
 from rag.vector_store import get_vector_store
 from ingestion.chunking import smart_chunk_documents
+from ingestion.metadata_schema import normalize_metadata, validate_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -76,18 +77,22 @@ def run_ingestion(folder_path: str) -> int:
     texts = [n.get_content() for n in nodes]
     metadatas = []
     
-    # Ensure metadata has file_path for consistent identification
-    for node in nodes:
-        metadata = node.metadata or {}
-        # Normalize file_path - use file_path, file_name, filename, or source
-        if not metadata.get("file_path"):
-            metadata["file_path"] = (
-                metadata.get("file_name") or 
-                metadata.get("filename") or 
-                metadata.get("source") or
-                "unknown"
-            )
-        metadatas.append(metadata)
+    # Normalize and validate metadata for consistent identification
+    for idx, node in enumerate(nodes):
+        raw_metadata = node.metadata or {}
+        # Normalize metadata to use standard field names
+        normalized_metadata = normalize_metadata(raw_metadata)
+        
+        # Add chunk index if not present
+        if "chunk_index" not in normalized_metadata:
+            normalized_metadata["chunk_index"] = idx
+        
+        # Validate metadata
+        is_valid, error_msg = validate_metadata(normalized_metadata, strict=False)
+        if not is_valid:
+            logger.warning(f"Metadata validation warning for chunk {idx}: {error_msg}")
+        
+        metadatas.append(normalized_metadata)
 
     try:
         embeddings = embed_texts(texts)

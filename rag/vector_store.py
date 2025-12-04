@@ -5,6 +5,7 @@ import chromadb
 from chromadb import PersistentClient
 
 from config.settings import get_settings
+from ingestion.metadata_schema import normalize_metadata, get_file_path, MetadataFields
 
 
 _client: Optional[PersistentClient] = None
@@ -42,29 +43,26 @@ class VectorStore:
         metadatas: Iterable[Dict[str, Any]],
         embeddings: Iterable[List[float]],
     ) -> None:
-        # Generate unique IDs using UUID, optionally combining with file_path if available
+        # Normalize all metadata to ensure consistency
         texts_list = list(texts)
         metadatas_list = list(metadatas)
+        normalized_metadatas = []
         ids = []
+        
         for idx, metadata in enumerate(metadatas_list):
-            # Try to create a more meaningful ID using file_path if available
-            file_path = (
-                metadata.get("file_path") or 
-                metadata.get("file_name") or 
-                metadata.get("filename") or 
-                metadata.get("source")
-            )
-            if file_path:
-                # Create ID that includes file_path and chunk index for better tracking
-                ids.append(f"{file_path}_{idx}_{uuid.uuid4().hex[:8]}")
-            else:
-                # Fallback to UUID if no file_path available
-                ids.append(str(uuid.uuid4()))
+            # Normalize metadata to use standard field names
+            normalized_metadata = normalize_metadata(metadata)
+            normalized_metadatas.append(normalized_metadata)
+            
+            # Create ID using normalized file_path
+            file_path = normalized_metadata.get(MetadataFields.FILE_PATH, "unknown")
+            chunk_index = normalized_metadata.get(MetadataFields.CHUNK_INDEX, idx)
+            ids.append(f"{file_path}_{chunk_index}_{uuid.uuid4().hex[:8]}")
         
         self._collection.add(
             ids=ids,
             documents=texts_list,
-            metadatas=metadatas_list,
+            metadatas=normalized_metadatas,
             embeddings=list(embeddings),
         )
 
@@ -90,7 +88,7 @@ class VectorStore:
             if not results or not results.get("metadatas"):
                 return []
             
-            # Extract unique documents based on file_path or file_name
+            # Extract unique documents based on normalized file_path
             seen_docs = {}
             metadatas = results.get("metadatas", [])
             ids = results.get("ids", [])
@@ -99,21 +97,16 @@ class VectorStore:
                 if not metadata:
                     continue
                 
-                # Try to get file_path or file_name from metadata
-                doc_key = (
-                    metadata.get("file_path") or 
-                    metadata.get("file_name") or 
-                    metadata.get("filename") or
-                    metadata.get("source") or
-                    f"Document_{ids[idx]}"
-                )
+                # Normalize metadata to get consistent file_path
+                normalized_metadata = normalize_metadata(metadata)
+                doc_key = normalized_metadata.get(MetadataFields.FILE_PATH, f"Document_{ids[idx]}")
                 
                 # If we haven't seen this document, add it
                 if doc_key not in seen_docs:
                     seen_docs[doc_key] = {
                         "name": doc_key,
-                        "file_path": metadata.get("file_path") or metadata.get("file_name") or doc_key,
-                        "page": metadata.get("page"),
+                        "file_path": doc_key,
+                        "page": normalized_metadata.get(MetadataFields.PAGE),
                         "chunk_count": 1,
                     }
                 else:
@@ -129,32 +122,31 @@ class VectorStore:
         """
         Get all chunks for a specific document identified by file_path.
         Returns a list of chunks with their content, metadata, and IDs.
+        
+        Uses normalized file_path field for consistent querying.
         """
         try:
-            # Query ChromaDB for each possible metadata field name
-            # ChromaDB where clause supports simple equality checks
-            all_ids = set()
-            all_chunks = {}
+            # Query using normalized file_path field
+            results = self._collection.get(where={MetadataFields.FILE_PATH: file_path})
             
-            # Try each possible metadata field name
-            metadata_fields = ["file_path", "file_name", "filename", "source"]
-            for field in metadata_fields:
-                try:
-                    results = self._collection.get(where={field: file_path})
-                    if results and results.get("ids"):
-                        for idx, chunk_id in enumerate(results.get("ids", [])):
-                            if chunk_id not in all_ids:
-                                all_ids.add(chunk_id)
-                                all_chunks[chunk_id] = {
-                                    "id": chunk_id,
-                                    "content": results.get("documents", [])[idx] if idx < len(results.get("documents", [])) else "",
-                                    "metadata": results.get("metadatas", [])[idx] if idx < len(results.get("metadatas", [])) else {},
-                                }
-                except Exception:
-                    # Continue if this field doesn't exist or query fails
-                    continue
+            if not results or not results.get("ids"):
+                return []
             
-            return list(all_chunks.values())
+            chunks = []
+            ids = results.get("ids", [])
+            documents = results.get("documents", [])
+            metadatas = results.get("metadatas", [])
+            
+            for idx, chunk_id in enumerate(ids):
+                # Normalize metadata to ensure consistency
+                metadata = normalize_metadata(metadatas[idx] if idx < len(metadatas) else {})
+                chunks.append({
+                    "id": chunk_id,
+                    "content": documents[idx] if idx < len(documents) else "",
+                    "metadata": metadata,
+                })
+            
+            return chunks
         except Exception as e:
             # Return empty list if there's an error
             return []
@@ -163,6 +155,8 @@ class VectorStore:
         """
         Delete all chunks for a specific document identified by file_path.
         Returns the number of chunks deleted.
+        
+        Uses normalized file_path field for consistent deletion.
         """
         try:
             # First, get all chunks for this document to count them
@@ -172,24 +166,15 @@ class VectorStore:
             
             chunk_count = len(chunks)
             
-            # Delete using metadata filter for each possible field
-            # ChromaDB delete supports where clause with simple equality checks
-            deleted_count = 0
-            metadata_fields = ["file_path", "file_name", "filename", "source"]
+            # Delete using normalized file_path field
+            try:
+                self._collection.delete(where={MetadataFields.FILE_PATH: file_path})
+            except Exception as e:
+                # Log error but return count we found
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Error deleting document chunks: {e}")
             
-            for field in metadata_fields:
-                try:
-                    # Delete chunks matching this field
-                    self._collection.delete(where={field: file_path})
-                    # Note: ChromaDB delete doesn't return count, so we track by trying each field
-                    # Since we already counted chunks above, we'll return that count
-                except Exception:
-                    # Continue if this field doesn't exist or deletion fails
-                    continue
-            
-            # Return the count we got from get_document_chunks
-            # Note: If deletion partially fails, this might not be accurate,
-            # but it's the best we can do without ChromaDB returning deletion count
             return chunk_count
         except Exception as e:
             # Return 0 if deletion fails
