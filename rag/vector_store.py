@@ -212,9 +212,19 @@ class VectorStore:
             if should_reingest:
                 # Document changed or new - delete old chunks and add new ones
                 if existing_version:
-                    # Delete old chunks
-                    deleted_count = self.delete_document(file_path)
-                    logger.info(f"Deleted {deleted_count} old chunks for {file_path}")
+                    # Delete old chunks - this will raise if deletion fails
+                    try:
+                        deleted_count = self.delete_document(file_path)
+                        logger.info(f"Deleted {deleted_count} old chunks for {file_path}")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to delete old chunks for {file_path}: {e}. "
+                            "Skipping re-ingestion to prevent duplicate chunks."
+                        )
+                        # Skip this document to prevent duplicate ID errors
+                        stats["skipped_count"] += len(doc_data["texts"])
+                        continue
+                    
                     stats["updated_count"] += len(doc_data["texts"])
                     
                     # Increment version
@@ -413,7 +423,13 @@ class VectorStore:
         Returns the number of chunks deleted.
         
         Uses normalized file_path field for consistent deletion.
+        
+        Raises:
+            Exception: If deletion fails, to prevent false success reporting
         """
+        import logging
+        logger = logging.getLogger(__name__)
+        
         try:
             # First, get all chunks for this document to count them
             chunks = self.get_document_chunks(file_path)
@@ -425,15 +441,36 @@ class VectorStore:
             # Delete using normalized file_path field
             try:
                 self._collection.delete(where={MetadataFields.FILE_PATH: file_path})
+                
+                # Verify deletion succeeded by checking if chunks still exist
+                remaining_chunks = self.get_document_chunks(file_path)
+                if remaining_chunks:
+                    # Deletion failed - chunks still exist
+                    logger.error(
+                        f"Deletion verification failed: {len(remaining_chunks)} chunks still exist "
+                        f"for {file_path} after delete operation"
+                    )
+                    raise RuntimeError(
+                        f"Failed to delete chunks for {file_path}: "
+                        f"{len(remaining_chunks)} chunks still exist"
+                    )
+                
+                logger.info(f"Successfully deleted {chunk_count} chunks for {file_path}")
+                return chunk_count
+                
             except Exception as e:
-                # Log error but return count we found
-                import logging
-                logger = logging.getLogger(__name__)
-                logger.warning(f"Error deleting document chunks: {e}")
-            
-            return chunk_count
+                # Log error and re-raise to prevent false success reporting
+                logger.error(f"Error deleting document chunks for {file_path}: {e}", exc_info=True)
+                raise RuntimeError(
+                    f"Failed to delete chunks for {file_path}: {str(e)}"
+                ) from e
+                
+        except RuntimeError:
+            # Re-raise RuntimeError (deletion failure) as-is
+            raise
         except Exception as e:
-            # Return 0 if deletion fails
+            # Log unexpected errors and return 0
+            logger.error(f"Unexpected error in delete_document for {file_path}: {e}", exc_info=True)
             return 0
 
 
