@@ -1,6 +1,8 @@
+import hashlib
 import logging
+import os
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any, Optional
 
 from llama_index.core import Document, SimpleDirectoryReader
 
@@ -8,9 +10,60 @@ from rag.embeddings import embed_texts
 from rag.exceptions import IngestionError, EmbeddingError, StorageError
 from rag.vector_store import get_vector_store
 from ingestion.chunking import smart_chunk_documents
-from ingestion.metadata_schema import normalize_metadata, validate_metadata
+from ingestion.metadata_schema import normalize_metadata, validate_metadata, MetadataFields
 
 logger = logging.getLogger(__name__)
+
+
+def calculate_file_hash(file_path: str) -> str:
+    """
+    Calculate SHA256 hash of a file.
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        SHA256 hash as hexadecimal string
+    """
+    sha256_hash = hashlib.sha256()
+    try:
+        with open(file_path, "rb") as f:
+            # Read file in chunks to handle large files
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.warning(f"Failed to calculate hash for {file_path}: {e}")
+        # Return empty hash if file cannot be read
+        return ""
+
+
+def get_file_metadata(file_path: str) -> Dict[str, Any]:
+    """
+    Get file metadata including hash and modification time.
+    
+    Args:
+        file_path: Path to the file
+        
+    Returns:
+        Dictionary with file_hash and file_mtime
+    """
+    metadata = {}
+    
+    try:
+        if os.path.exists(file_path):
+            # Get modification time
+            mtime = os.path.getmtime(file_path)
+            metadata["file_mtime"] = mtime
+            
+            # Calculate hash
+            file_hash = calculate_file_hash(file_path)
+            if file_hash:
+                metadata["file_hash"] = file_hash
+    except Exception as e:
+        logger.warning(f"Failed to get metadata for {file_path}: {e}")
+    
+    return metadata
 
 
 def load_documents(folder_path: str) -> List[Document]:
@@ -77,6 +130,9 @@ def run_ingestion(folder_path: str) -> int:
     texts = [n.get_content() for n in nodes]
     metadatas = []
     
+    # Group nodes by document to calculate file metadata once per document
+    document_metadata_cache = {}
+    
     # Normalize and validate metadata for consistent identification
     for idx, node in enumerate(nodes):
         raw_metadata = node.metadata or {}
@@ -86,6 +142,47 @@ def run_ingestion(folder_path: str) -> int:
         # Add chunk index if not present
         if "chunk_index" not in normalized_metadata:
             normalized_metadata["chunk_index"] = idx
+        
+        # Get file path and calculate file metadata if not already cached
+        file_path = normalized_metadata.get(MetadataFields.FILE_PATH, "unknown")
+        if file_path != "unknown" and file_path not in document_metadata_cache:
+            # Try to get actual file path from the document
+            # File path might be relative, try to resolve it
+            try:
+                # Check if file exists at the path
+                if os.path.exists(file_path):
+                    file_meta = get_file_metadata(file_path)
+                    document_metadata_cache[file_path] = file_meta
+                else:
+                    # Try relative to folder_path
+                    full_path = os.path.join(folder_path, file_path)
+                    if os.path.exists(full_path):
+                        file_meta = get_file_metadata(full_path)
+                        document_metadata_cache[file_path] = file_meta
+                    else:
+                        # Try to find the file in the folder
+                        path_obj = Path(folder_path)
+                        found_file = None
+                        for f in path_obj.rglob(Path(file_path).name):
+                            if f.is_file():
+                                found_file = str(f)
+                                break
+                        if found_file:
+                            file_meta = get_file_metadata(found_file)
+                            document_metadata_cache[file_path] = file_meta
+                        else:
+                            document_metadata_cache[file_path] = {}
+            except Exception as e:
+                logger.warning(f"Could not get file metadata for {file_path}: {e}")
+                document_metadata_cache[file_path] = {}
+        
+        # Add file metadata to chunk metadata
+        if file_path in document_metadata_cache:
+            file_meta = document_metadata_cache[file_path]
+            if file_meta.get("file_hash"):
+                normalized_metadata[MetadataFields.FILE_HASH] = file_meta["file_hash"]
+            if file_meta.get("file_mtime") is not None:
+                normalized_metadata[MetadataFields.FILE_MTIME] = file_meta["file_mtime"]
         
         # Validate metadata
         is_valid, error_msg = validate_metadata(normalized_metadata, strict=False)
@@ -121,7 +218,13 @@ def run_ingestion(folder_path: str) -> int:
 
     try:
         vs = get_vector_store()
-        vs.add_documents(texts=texts, metadatas=metadatas, embeddings=embeddings)
+        stats = vs.upsert_documents(texts=texts, metadatas=metadatas, embeddings=embeddings)
+        logger.info(
+            f"Ingestion complete: {stats['updated_count']} updated, "
+            f"{stats['new_count']} new, {stats['skipped_count']} skipped"
+        )
+        # Return total chunks processed (updated + new)
+        return stats['updated_count'] + stats['new_count']
     except Exception as e:
         logger.error(f"Failed to store documents: {str(e)}", exc_info=True)
         raise IngestionError(
@@ -132,8 +235,5 @@ def run_ingestion(folder_path: str) -> int:
             ),
             details={"error_type": type(e).__name__}
         ) from e
-
-    logger.info(f"Successfully ingested {len(nodes)} chunks from {folder_path}")
-    return len(nodes)
 
 

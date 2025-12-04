@@ -33,6 +33,11 @@ class MetadataFields:
     HEADER_COUNT = "header_count"
     SECTION_HEADERS = "section_headers"
     HAS_LIST = "has_list"
+    
+    # Version tracking fields
+    FILE_HASH = "file_hash"
+    FILE_MTIME = "file_mtime"
+    DOCUMENT_VERSION = "document_version"
 
 
 # Legacy field names that should be normalized
@@ -111,6 +116,21 @@ class DocumentMetadata(BaseModel):
     has_list: Optional[bool] = Field(
         None,
         description="Whether the chunk contains lists"
+    )
+    
+    # Version tracking fields
+    file_hash: Optional[str] = Field(
+        None,
+        description="SHA256 hash of the source file content"
+    )
+    file_mtime: Optional[float] = Field(
+        None,
+        description="File modification time (Unix timestamp)"
+    )
+    document_version: Optional[int] = Field(
+        None,
+        description="Document version number (incremental)",
+        ge=0
     )
     
     # Allow extra fields for extensibility
