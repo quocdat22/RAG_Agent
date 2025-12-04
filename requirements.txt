@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+llama-index
+llama-index-readers-file
+chromadb
+rank-bm25
+cohere
+python-dotenv
+pydantic
+pydantic-settings
+httpx
+azure-ai-inference
+streamlit
