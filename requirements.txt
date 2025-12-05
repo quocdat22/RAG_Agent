@@ -11,6 +11,8 @@ pydantic-settings
 httpx
 azure-ai-inference
 streamlit
+plotly
+pandas
 pdfplumber
 # Optional OCR dependencies (uncomment if needed for scanned PDFs):
 pdf2image

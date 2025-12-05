@@ -18,6 +18,7 @@ from rag.exceptions import (
 )
 from rag.pipeline import AnswerWithSources, answer_query
 from storage.conversation_store import get_conversation_store
+from monitoring.metrics_store import get_metrics_store
 
 logger = logging.getLogger(__name__)
 
@@ -347,6 +348,96 @@ def create_app() -> FastAPI:
             conversation_id=conversation_id,
             title=conversation["title"],
         )
+
+    # Metrics endpoints
+    @app.get("/metrics/queries")
+    def get_query_metrics(
+        limit: int = 100,
+        offset: int = 0,
+        conversation_id: Optional[str] = None,
+        _: bool = Depends(verify_api_key),
+    ):
+        """Get query metrics."""
+        try:
+            store = get_metrics_store()
+            metrics = store.get_query_metrics(
+                limit=limit,
+                offset=offset,
+                conversation_id=conversation_id,
+            )
+            return {"metrics": metrics, "count": len(metrics)}
+        except Exception as e:
+            logger.error(f"Failed to get query metrics: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể lấy metrics: {str(e)}"
+            )
+
+    @app.get("/metrics/latency")
+    def get_latency_stats(_: bool = Depends(verify_api_key)):
+        """Get aggregated latency statistics."""
+        try:
+            store = get_metrics_store()
+            stats = store.get_latency_stats()
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get latency stats: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể lấy latency stats: {str(e)}"
+            )
+
+    @app.get("/metrics/retrieval")
+    def get_retrieval_stats(_: bool = Depends(verify_api_key)):
+        """Get aggregated retrieval statistics."""
+        try:
+            store = get_metrics_store()
+            stats = store.get_retrieval_stats()
+            return {"stats": stats}
+        except Exception as e:
+            logger.error(f"Failed to get retrieval stats: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể lấy retrieval stats: {str(e)}"
+            )
+
+    @app.get("/metrics/chunks")
+    def get_chunk_quality_stats(
+        query_metric_id: Optional[str] = None,
+        _: bool = Depends(verify_api_key),
+    ):
+        """Get aggregated chunk quality statistics."""
+        try:
+            store = get_metrics_store()
+            stats = store.get_chunk_quality_stats(query_metric_id=query_metric_id)
+            return stats
+        except Exception as e:
+            logger.error(f"Failed to get chunk quality stats: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể lấy chunk quality stats: {str(e)}"
+            )
+
+    @app.get("/metrics/summary")
+    def get_metrics_summary(_: bool = Depends(verify_api_key)):
+        """Get comprehensive metrics summary."""
+        try:
+            store = get_metrics_store()
+            latency_stats = store.get_latency_stats()
+            retrieval_stats = store.get_retrieval_stats()
+            chunk_stats = store.get_chunk_quality_stats()
+            
+            return {
+                "latency": latency_stats,
+                "retrieval": retrieval_stats,
+                "chunk_quality": chunk_stats,
+            }
+        except Exception as e:
+            logger.error(f"Failed to get metrics summary: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Không thể lấy metrics summary: {str(e)}"
+            )
 
     return app
 

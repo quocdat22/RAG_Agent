@@ -4,6 +4,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    # Feature flags
+    
+
     # Azure OpenAI (optional, you can skip if using GitHub Models)
     azure_openai_endpoint: Optional[str] = None
     azure_openai_api_key: Optional[str] = None
@@ -24,6 +27,9 @@ class Settings(BaseSettings):
 
     # Conversation storage
     conversation_db_path: str = "./data/conversations.db"
+
+    # Metrics storage
+    metrics_db_path: str = "./data/metrics.db"
 
     # API Authentication
     api_key: Optional[str] = None  # API key for authentication (env: API_KEY)
