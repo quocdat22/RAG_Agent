@@ -1,8 +1,9 @@
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from config.settings import get_settings
@@ -19,6 +20,65 @@ from rag.pipeline import AnswerWithSources, answer_query
 from storage.conversation_store import get_conversation_store
 
 logger = logging.getLogger(__name__)
+
+# Security scheme for API key authentication
+security = HTTPBearer(auto_error=False)
+
+
+def verify_api_key(
+    authorization: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    x_api_key: Optional[str] = Header(None, alias="X-API-Key"),
+) -> bool:
+    """
+    Verify API key from either Authorization header (Bearer token) or X-API-Key header.
+    
+    Args:
+        authorization: Bearer token from Authorization header
+        x_api_key: API key from X-API-Key header
+    
+    Returns:
+        True if API key is valid or not required, False otherwise
+    
+    Raises:
+        HTTPException: If API key is required but invalid or missing
+    """
+    settings = get_settings()
+    
+    # If no API key is configured, allow all requests (backward compatibility)
+    if not settings.api_key:
+        return True
+    
+    # Check X-API-Key header first (more common for API keys)
+    if x_api_key:
+        if x_api_key == settings.api_key:
+            return True
+        else:
+            logger.warning(f"Invalid API key provided in X-API-Key header")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    
+    # Check Authorization header (Bearer token)
+    if authorization:
+        if authorization.credentials == settings.api_key:
+            return True
+        else:
+            logger.warning(f"Invalid API key provided in Authorization header")
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid API key",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    
+    # No API key provided but one is required
+    logger.warning("API key required but not provided")
+    raise HTTPException(
+        status_code=401,
+        detail="API key required. Provide it in X-API-Key header or Authorization header (Bearer token)",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 class IngestRequest(BaseModel):
@@ -111,7 +171,7 @@ def create_app() -> FastAPI:
         )
 
     @app.post("/ingest-folder")
-    def ingest_folder(payload: IngestRequest):
+    def ingest_folder(payload: IngestRequest, _: bool = Depends(verify_api_key)):
         try:
             count = run_ingestion(payload.folder_path)
         except ValueError as e:
@@ -128,7 +188,7 @@ def create_app() -> FastAPI:
         return {"inserted_chunks": count}
 
     @app.post("/query", response_model=QueryResponse)
-    def query(payload: QueryRequest):
+    def query(payload: QueryRequest, _: bool = Depends(verify_api_key)):
         if not payload.query.strip():
             raise HTTPException(
                 status_code=400,
@@ -198,7 +258,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/conversations", response_model=list[ConversationResponse])
-    def list_conversations(limit: int = 50, offset: int = 0):
+    def list_conversations(limit: int = 50, offset: int = 0, _: bool = Depends(verify_api_key)):
         try:
             store = get_conversation_store()
             conversations = store.list_conversations(limit=limit, offset=offset)
@@ -221,7 +281,7 @@ def create_app() -> FastAPI:
         ]
 
     @app.get("/conversations/{conversation_id}", response_model=ConversationDetailResponse)
-    def get_conversation(conversation_id: str):
+    def get_conversation(conversation_id: str, _: bool = Depends(verify_api_key)):
         try:
             store = get_conversation_store()
             conversation = store.get_conversation(conversation_id)
@@ -250,7 +310,7 @@ def create_app() -> FastAPI:
         )
 
     @app.delete("/conversations/{conversation_id}")
-    def delete_conversation(conversation_id: str):
+    def delete_conversation(conversation_id: str, _: bool = Depends(verify_api_key)):
         try:
             store = get_conversation_store()
             success = store.delete_conversation(conversation_id)
@@ -271,7 +331,7 @@ def create_app() -> FastAPI:
         return {"message": "Đã xóa cuộc trò chuyện thành công"}
 
     @app.post("/conversations", response_model=CreateConversationResponse)
-    def create_conversation(payload: CreateConversationRequest):
+    def create_conversation(payload: CreateConversationRequest, _: bool = Depends(verify_api_key)):
         try:
             store = get_conversation_store()
             conversation_id = store.create_conversation(title=payload.title)

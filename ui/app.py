@@ -1,7 +1,9 @@
 import os
 import sys
 import tempfile
+import mimetypes
 from pathlib import Path
+from typing import List
 
 import streamlit as st
 
@@ -21,10 +23,132 @@ from ui.state_manager import StateManager
 st.set_page_config(page_title="RAG Agent MVP", page_icon="💬", layout="wide")
 
 
+# Allowed MIME types for file uploads
+ALLOWED_MIME_TYPES = {
+    # Documents
+    'application/pdf',
+    'application/msword',  # .doc
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document',  # .docx
+    'application/vnd.ms-excel',  # .xls
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',  # .xlsx
+    'application/vnd.ms-powerpoint',  # .ppt
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',  # .pptx
+    # Text files
+    'text/plain',
+    'text/html',
+    'text/markdown',
+    'text/csv',
+    # Images (for OCR if needed)
+    'image/png',
+    'image/jpeg',
+    'image/jpg',
+    'image/gif',
+    'image/bmp',
+    'image/tiff',
+}
+
+# Allowed file extensions (fallback if MIME type detection fails)
+ALLOWED_EXTENSIONS = {
+    '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+    '.txt', '.html', '.htm', '.md', '.markdown', '.csv',
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif'
+}
+
+
+def validate_file_type(file) -> bool:
+    """
+    Validate file MIME type and extension.
+    
+    Args:
+        file: Streamlit UploadedFile object
+    
+    Returns:
+        True if file type is allowed, False otherwise
+    """
+    # Check file extension
+    file_ext = Path(file.name).suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
+        return False
+    
+    # Check MIME type
+    # First try to get MIME type from file name
+    mime_type, _ = mimetypes.guess_type(file.name)
+    
+    # If MIME type detection failed, try to detect from content
+    if not mime_type:
+        # Read first few bytes to detect MIME type
+        file.seek(0)
+        header = file.read(1024)
+        file.seek(0)  # Reset file pointer
+        
+        # Check for PDF magic bytes
+        if header.startswith(b'%PDF'):
+            mime_type = 'application/pdf'
+        # Check for Office Open XML (DOCX, XLSX, PPTX)
+        elif header.startswith(b'PK\x03\x04'):
+            # Could be DOCX, XLSX, PPTX - check extension
+            if file_ext == '.docx':
+                mime_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            elif file_ext == '.xlsx':
+                mime_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            elif file_ext == '.pptx':
+                mime_type = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        # Check for HTML
+        elif header.strip().startswith(b'<html') or header.strip().startswith(b'<!DOCTYPE'):
+            mime_type = 'text/html'
+        # Check for plain text
+        elif header.strip().startswith(b'<?xml'):
+            mime_type = 'text/xml'
+        else:
+            # Default to text/plain if we can't detect
+            mime_type = 'text/plain'
+    
+    # Normalize MIME type (remove charset, etc.)
+    if mime_type:
+        mime_type = mime_type.split(';')[0].strip().lower()
+    
+    # Check if MIME type is allowed
+    if mime_type and mime_type in ALLOWED_MIME_TYPES:
+        return True
+    
+    # Fallback: if extension is allowed but MIME type doesn't match, 
+    # still allow it (some servers send wrong MIME types)
+    if file_ext in ALLOWED_EXTENSIONS:
+        return True
+    
+    return False
+
+
 def save_uploaded_files(files) -> str:
     """
     Save uploaded files into a temporary directory and return its path.
+    Validates MIME types before saving.
+    
+    Args:
+        files: List of Streamlit UploadedFile objects
+    
+    Returns:
+        Path to temporary directory containing saved files
+    
+    Raises:
+        ValueError: If any file has an invalid MIME type
     """
+    if not files:
+        raise ValueError("No files provided")
+    
+    # Validate all files first
+    invalid_files = []
+    for f in files:
+        if not validate_file_type(f):
+            invalid_files.append(f.name)
+    
+    if invalid_files:
+        raise ValueError(
+            f"Invalid file type(s): {', '.join(invalid_files)}. "
+            f"Allowed types: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX, TXT, HTML, MD, CSV, and common image formats."
+        )
+    
+    # All files are valid, save them
     tmp_dir = Path(tempfile.mkdtemp(prefix="rag_uploads_"))
     for f in files:
         out_path = tmp_dir / f.name
@@ -117,6 +241,9 @@ def sidebar_ingestion():
                 st.sidebar.success(f"Ingest xong {count} chunks từ thư mục tạm.")
                 # Reset document state after ingestion
                 StateManager.reset_document_state()
+            except ValueError as e:
+                # File validation error
+                st.sidebar.error(f"⚠️ {str(e)}")
             except RAGAgentException as e:
                 st.sidebar.error(f"⚠️ {e.user_message}")
             except Exception as e:
