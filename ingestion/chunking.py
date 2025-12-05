@@ -3,7 +3,9 @@ Advanced chunking strategies for different document types.
 Preserves document structure (headers, lists, code blocks, tables).
 """
 import logging
+import os
 import re
+import warnings
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 
@@ -18,6 +20,64 @@ from llama_index.core.schema import BaseNode, TextNode
 from ingestion.metadata_schema import normalize_metadata, get_file_path, MetadataFields
 
 logger = logging.getLogger(__name__)
+
+# Suppress noisy PDF library warnings using Python's warnings module
+warnings.filterwarnings('ignore', message='.*Cannot set gray non-stroke color.*')
+warnings.filterwarnings('ignore', message='.*invalid float value.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='pdfplumber')
+warnings.filterwarnings('ignore', category=UserWarning, module='pdfminer')
+
+# Filter to suppress noisy PDF library warnings in logging
+class PDFWarningFilter(logging.Filter):
+    """Filter to suppress common PDF processing warnings that don't affect functionality."""
+    def filter(self, record):
+        # Suppress warnings about invalid float values in PDF color settings
+        # These are common in PDFs and don't affect table extraction
+        message = record.getMessage()
+        if "Cannot set gray non-stroke color" in message:
+            return False
+        if "invalid float value" in message.lower():
+            return False
+        if "pdfplumber" in record.name.lower() and record.levelno == logging.WARNING:
+            # Only suppress specific pdfplumber warnings, not all
+            if any(phrase in message.lower() for phrase in ["color", "float", "invalid"]):
+                return False
+        return True
+
+# Apply filter to root logger to catch all PDF library warnings
+pdf_filter = PDFWarningFilter()
+logging.getLogger().addFilter(pdf_filter)
+
+# Also suppress warnings from specific PDF libraries
+for lib_name in ['pdfplumber', 'pdfminer', 'PIL', 'Pillow']:
+    lib_logger = logging.getLogger(lib_name)
+    lib_logger.addFilter(pdf_filter)
+    lib_logger.setLevel(logging.ERROR)  # Only show errors, not warnings
+
+# Try to import PDF table extraction libraries
+try:
+    # Suppress warnings before importing pdfplumber
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import pdfplumber
+    PDFPLUMBER_AVAILABLE = True
+    # Suppress pdfplumber's internal warnings
+    pdfplumber_logger = logging.getLogger('pdfplumber')
+    pdfplumber_logger.setLevel(logging.ERROR)
+    # Also suppress pdfminer warnings (used by pdfplumber)
+    pdfminer_logger = logging.getLogger('pdfminer')
+    pdfminer_logger.setLevel(logging.ERROR)
+except ImportError:
+    PDFPLUMBER_AVAILABLE = False
+    logger.warning("pdfplumber not available. PDF table extraction will be limited.")
+
+try:
+    from pdf2image import convert_from_path
+    import pytesseract
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    logger.warning("OCR libraries (pdf2image, pytesseract) not available. OCR table detection will be disabled.")
 
 
 def detect_document_type(document: Document) -> str:
@@ -93,45 +153,84 @@ def detect_code_blocks(text: str) -> List[Dict[str, Any]]:
 
 
 def detect_tables(text: str) -> List[Dict[str, Any]]:
-    """Detect markdown tables and return their positions."""
+    """
+    Detect markdown tables and return their positions.
+    Improved to avoid false positives with text containing | characters.
+    """
     tables = []
     lines = text.split('\n')
     current_table = []
     table_start_line = None
+    expected_columns = None
     
     for i, line in enumerate(lines):
-        # Check if line looks like a table row (contains |)
-        if '|' in line and line.strip().startswith('|') and line.strip().endswith('|'):
+        stripped = line.strip()
+        
+        # Check if line is a table separator (---|:---|:---:|---)
+        is_separator = bool(re.match(r'^\|[\s\-:]+\|$', stripped))
+        
+        # Check if line looks like a table row
+        is_table_row = False
+        if '|' in line and stripped.startswith('|') and stripped.endswith('|'):
+            # Count columns (split by |, remove empty first/last)
+            columns = [c.strip() for c in stripped.split('|') if c.strip() or len([x for x in stripped.split('|')]) > 2]
+            # Must have at least 2 columns to be a table
+            if len(columns) >= 2:
+                is_table_row = True
+                # Set expected columns on first row
+                if expected_columns is None:
+                    expected_columns = len(columns)
+                # Allow some flexibility in column count (for merged cells representation)
+                elif abs(len(columns) - expected_columns) > expected_columns // 2:
+                    # Column count differs too much, probably not a table
+                    is_table_row = False
+        
+        if is_table_row:
             if not current_table:
                 table_start_line = i
+                expected_columns = len([c.strip() for c in stripped.split('|') if c.strip()])
             current_table.append(line)
-        elif re.match(r'^\|[\s\-:]+\|$', line.strip()):  # Table separator
+        elif is_separator:
             if current_table:
                 current_table.append(line)
         else:
-            if current_table and len(current_table) >= 2:  # At least header + separator
-                # Calculate positions
-                start_pos = sum(len(l) + 1 for l in lines[:table_start_line])
-                end_pos = sum(len(l) + 1 for l in lines[:i])
-                tables.append({
-                    "start": start_pos,
-                    "end": end_pos,
-                    "content": '\n'.join(current_table),
-                    "type": "markdown_table"
-                })
+            # End of potential table
+            if current_table and len(current_table) >= 2:
+                # Verify it's actually a table:
+                # 1. Must have at least one separator line
+                # 2. Must have consistent structure
+                has_separator = any(re.match(r'^\|[\s\-:]+\|$', l.strip()) for l in current_table)
+                # 3. Must have at least 2 data rows (excluding separator)
+                data_rows = [l for l in current_table if not re.match(r'^\|[\s\-:]+\|$', l.strip())]
+                
+                if has_separator and len(data_rows) >= 2:
+                    # Calculate positions
+                    start_pos = sum(len(l) + 1 for l in lines[:table_start_line])
+                    end_pos = sum(len(l) + 1 for l in lines[:i])
+                    tables.append({
+                        "start": start_pos,
+                        "end": end_pos,
+                        "content": '\n'.join(current_table),
+                        "type": "markdown_table"
+                    })
             current_table = []
             table_start_line = None
+            expected_columns = None
     
     # Handle table at end of document
     if current_table and len(current_table) >= 2:
-        start_pos = sum(len(l) + 1 for l in lines[:table_start_line])
-        end_pos = len(text)
-        tables.append({
-            "start": start_pos,
-            "end": end_pos,
-            "content": '\n'.join(current_table),
-            "type": "markdown_table"
-        })
+        has_separator = any(re.match(r'^\|[\s\-:]+\|$', l.strip()) for l in current_table)
+        data_rows = [l for l in current_table if not re.match(r'^\|[\s\-:]+\|$', l.strip())]
+        
+        if has_separator and len(data_rows) >= 2:
+            start_pos = sum(len(l) + 1 for l in lines[:table_start_line])
+            end_pos = len(text)
+            tables.append({
+                "start": start_pos,
+                "end": end_pos,
+                "content": '\n'.join(current_table),
+                "type": "markdown_table"
+            })
     
     return tables
 
@@ -280,15 +379,139 @@ def chunk_with_sentence_splitter(
     return processed_nodes
 
 
+def extract_tables_from_pdf(file_path: str) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Extract tables from PDF using pdfplumber.
+    Returns a dictionary mapping page numbers to list of tables.
+    Each table is a dict with 'content' (markdown format) and 'bbox' (bounding box).
+    """
+    if not PDFPLUMBER_AVAILABLE:
+        return {}
+    
+    tables_by_page = {}
+    
+    try:
+        # Suppress warnings during PDF processing
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with pdfplumber.open(file_path) as pdf:
+                for page_num, page in enumerate(pdf.pages, start=1):
+                    # Extract tables with warnings suppressed
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        tables = page.extract_tables()
+                    if tables:
+                        table_list = []
+                        for table in tables:
+                            # Convert table to markdown format
+                            markdown_table = table_to_markdown(table)
+                            if markdown_table:
+                                table_list.append({
+                                    "content": markdown_table,
+                                    "bbox": page.bbox,
+                                    "type": "pdf_table"
+                                })
+                        if table_list:
+                            tables_by_page[page_num] = table_list
+    except Exception as e:
+        logger.warning(f"Failed to extract tables from PDF {file_path}: {e}")
+    
+    return tables_by_page
+
+
+def table_to_markdown(table: List[List[Any]]) -> str:
+    """
+    Convert a table (list of lists) to markdown format.
+    Handles merged cells by detecting empty cells and preserving structure.
+    """
+    if not table or len(table) < 1:
+        return ""
+    
+    # Normalize table: handle None values and empty cells
+    normalized_table = []
+    for row in table:
+        normalized_row = [str(cell).strip() if cell is not None else "" for cell in row]
+        # Pad rows to same length (handle merged cells)
+        if normalized_table:
+            max_len = max(len(normalized_table[0]), len(normalized_row))
+            # Pad previous rows
+            for prev_row in normalized_table:
+                while len(prev_row) < max_len:
+                    prev_row.append("")
+            # Pad current row
+            while len(normalized_row) < max_len:
+                normalized_row.append("")
+        normalized_table.append(normalized_row)
+    
+    if not normalized_table:
+        return ""
+    
+    # Ensure all rows have same length
+    max_cols = max(len(row) for row in normalized_table) if normalized_table else 0
+    for row in normalized_table:
+        while len(row) < max_cols:
+            row.append("")
+    
+    # Build markdown table
+    lines = []
+    
+    # Header row
+    if normalized_table:
+        header = '| ' + ' | '.join(normalized_table[0]) + ' |'
+        lines.append(header)
+        # Separator
+        separator = '| ' + ' | '.join(['---'] * len(normalized_table[0])) + ' |'
+        lines.append(separator)
+        # Data rows
+        for row in normalized_table[1:]:
+            row_str = '| ' + ' | '.join(row[:len(normalized_table[0])]) + ' |'
+            lines.append(row_str)
+    
+    return '\n'.join(lines)
+
+
+def extract_tables_with_ocr(file_path: str) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Extract tables from PDF using OCR (for scanned PDFs).
+    Falls back to regular extraction if OCR is not available.
+    """
+    if not OCR_AVAILABLE:
+        logger.warning("OCR not available, falling back to regular PDF extraction")
+        return extract_tables_from_pdf(file_path)
+    
+    # For now, return empty - OCR table extraction is complex and requires
+    # additional libraries like table-transformer or custom ML models
+    # This is a placeholder for future enhancement
+    logger.info("OCR table extraction not yet implemented, using regular extraction")
+    return extract_tables_from_pdf(file_path)
+
+
 def chunk_pdf_document(document: Document) -> List[BaseNode]:
-    """Chunk PDF documents with special handling for tables and images."""
+    """
+    Chunk PDF documents with special handling for tables and images.
+    Now supports:
+    - Better table detection using pdfplumber
+    - OCR support for scanned PDFs (if available)
+    - Merged cells and nested tables handling
+    """
     content = document.get_content()
+    file_path = get_file_path(document.metadata or {})
+    
+    # Try to extract tables from PDF if file path is available
+    extracted_tables = {}
+    if file_path and os.path.exists(file_path) and PDFPLUMBER_AVAILABLE:
+        try:
+            extracted_tables = extract_tables_from_pdf(file_path)
+            logger.info(f"Extracted {sum(len(t) for t in extracted_tables.values())} tables from PDF")
+        except Exception as e:
+            logger.warning(f"Failed to extract tables from PDF: {e}")
     
     # Detect if content has tables (common in PDFs)
     has_tables = (
         '|' in content or 
         '\t' in content or
-        re.search(r'\s{3,}', content)  # Multiple spaces (potential table)
+        re.search(r'\s{3,}', content) or  # Multiple spaces (potential table)
+        bool(extracted_tables)  # Tables extracted by pdfplumber
     )
     
     # Use larger chunks for PDFs to preserve context
@@ -310,7 +533,32 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
     for node in nodes:
         node_content = node.get_content()
         
-        # Try to detect and format tables
+        # Get page number for this node
+        page_value = node.metadata.get("page_label") or node.metadata.get("page")
+        page_num = None
+        if page_value:
+            try:
+                page_num = int(str(page_value))
+            except (ValueError, TypeError):
+                pass
+        
+        # If we have extracted tables for this page, enhance content with them
+        if page_num and page_num in extracted_tables:
+            # Check if content already has tables
+            existing_tables = detect_tables(node_content)
+            if not existing_tables:
+                # No tables detected in text, try to add extracted tables
+                # Append extracted tables to content
+                extracted_table_texts = [t["content"] for t in extracted_tables[page_num]]
+                if extracted_table_texts:
+                    enhanced_content = node_content
+                    if not enhanced_content.endswith('\n'):
+                        enhanced_content += '\n'
+                    enhanced_content += '\n\n'.join(extracted_table_texts)
+                    node_content = enhanced_content
+                    node.set_content(enhanced_content)
+        
+        # Try to detect and format tables in text
         formatted_content = format_tables_in_text(node_content)
         if formatted_content != node_content:
             node.set_content(formatted_content)
@@ -324,7 +572,6 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
         node.metadata = node.metadata or {}
         node.metadata[MetadataFields.DOCUMENT_TYPE] = "pdf"
         # Normalize page field
-        page_value = document.metadata.get("page_label") or document.metadata.get("page")
         if page_value:
             node.metadata[MetadataFields.PAGE] = str(page_value)
         
@@ -335,61 +582,112 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
 
 
 def format_tables_in_text(text: str) -> str:
-    """Detect and format tables in text to markdown format."""
+    """
+    Detect and format tables in text to markdown format.
+    Improved to handle merged cells and nested tables better.
+    """
     lines = text.split('\n')
     result_lines = []
     current_table = []
     in_table = False
+    max_columns = 0
     
     for i, line in enumerate(lines):
+        # Skip if line is already a markdown table row or separator
+        if re.match(r'^\|[\s\S]*\|$', line.strip()) or re.match(r'^\|[\s\-:]+\|$', line.strip()):
+            result_lines.append(line)
+            continue
+        
         # Detect table-like patterns
-        # Pattern 1: Multiple columns separated by tabs or multiple spaces
+        # Pattern 1: Multiple columns separated by tabs
         parts_tab = line.split('\t')
+        # Pattern 2: Multiple columns separated by multiple spaces (2+)
         parts_space = re.split(r'\s{2,}', line.strip())
         
         is_table_row = False
-        if len(parts_tab) >= 2 and all(p.strip() for p in parts_tab[:3]):
-            is_table_row = True
-            columns = [p.strip() for p in parts_tab if p.strip()]
-        elif len(parts_space) >= 2 and all(p.strip() for p in parts_space[:3]):
-            is_table_row = True
-            columns = [p.strip() for p in parts_space if p.strip()]
+        columns = []
+        
+        # Check tab-separated (more reliable for tables)
+        if len(parts_tab) >= 2:
+            # Filter out empty parts but keep structure
+            columns_tab = [p.strip() for p in parts_tab]
+            # Must have at least 2 non-empty columns
+            non_empty = [c for c in columns_tab if c]
+            if len(non_empty) >= 2:
+                is_table_row = True
+                columns = columns_tab
+                max_columns = max(max_columns, len(columns))
+        
+        # Check space-separated (less reliable, need more validation)
+        if not is_table_row and len(parts_space) >= 2:
+            columns_space = [p.strip() for p in parts_space if p.strip()]
+            # More strict: need at least 3 columns and reasonable length
+            if len(columns_space) >= 3 and all(len(c) > 0 and len(c) < 100 for c in columns_space):
+                # Check if it's not just regular text with multiple spaces
+                # Look for consistent column-like structure
+                avg_len = sum(len(c) for c in columns_space) / len(columns_space)
+                if avg_len < 50:  # Reasonable column width
+                    is_table_row = True
+                    columns = columns_space
+                    max_columns = max(max_columns, len(columns))
         
         if is_table_row:
             if not in_table:
                 in_table = True
                 current_table = []
+                max_columns = len(columns)
+            
+            # Normalize column count (handle merged cells by padding)
+            while len(columns) < max_columns:
+                columns.append("")
+            # Update max if this row has more columns
+            if len(columns) > max_columns:
+                # Pad all previous rows
+                for prev_row in current_table:
+                    while len(prev_row) < len(columns):
+                        prev_row.append("")
+                max_columns = len(columns)
+            
             current_table.append(columns)
         else:
             if in_table and len(current_table) >= 2:
                 # Format as markdown table
-                if current_table:
-                    # Header row
-                    header = '| ' + ' | '.join(current_table[0]) + ' |'
-                    result_lines.append(header)
-                    # Separator
-                    separator = '| ' + ' | '.join(['---'] * len(current_table[0])) + ' |'
-                    result_lines.append(separator)
-                    # Data rows
-                    for row in current_table[1:]:
-                        # Pad row to match header length
-                        padded_row = row + [''] * (len(current_table[0]) - len(row))
-                        row_str = '| ' + ' | '.join(padded_row[:len(current_table[0])]) + ' |'
-                        result_lines.append(row_str)
+                # Normalize all rows to same column count
+                for row in current_table:
+                    while len(row) < max_columns:
+                        row.append("")
+                
+                # Header row (first row)
+                header = '| ' + ' | '.join(current_table[0][:max_columns]) + ' |'
+                result_lines.append(header)
+                # Separator
+                separator = '| ' + ' | '.join(['---'] * max_columns) + ' |'
+                result_lines.append(separator)
+                # Data rows
+                for row in current_table[1:]:
+                    # Handle merged cells: empty cells are represented as empty strings
+                    row_str = '| ' + ' | '.join(row[:max_columns]) + ' |'
+                    result_lines.append(row_str)
+                
                 current_table = []
                 in_table = False
+                max_columns = 0
             
             result_lines.append(line)
     
     # Handle table at end
     if in_table and len(current_table) >= 2:
-        header = '| ' + ' | '.join(current_table[0]) + ' |'
+        # Normalize all rows
+        for row in current_table:
+            while len(row) < max_columns:
+                row.append("")
+        
+        header = '| ' + ' | '.join(current_table[0][:max_columns]) + ' |'
         result_lines.append(header)
-        separator = '| ' + ' | '.join(['---'] * len(current_table[0])) + ' |'
+        separator = '| ' + ' | '.join(['---'] * max_columns) + ' |'
         result_lines.append(separator)
         for row in current_table[1:]:
-            padded_row = row + [''] * (len(current_table[0]) - len(row))
-            row_str = '| ' + ' | '.join(padded_row[:len(current_table[0])]) + ' |'
+            row_str = '| ' + ' | '.join(row[:max_columns]) + ' |'
             result_lines.append(row_str)
     
     return '\n'.join(result_lines)

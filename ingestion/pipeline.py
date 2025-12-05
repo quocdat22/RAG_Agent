@@ -1,10 +1,17 @@
 import hashlib
 import logging
 import os
+import warnings
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from llama_index.core import Document, SimpleDirectoryReader
+
+# Suppress noisy PDF library warnings
+warnings.filterwarnings('ignore', message='.*Cannot set gray non-stroke color.*')
+warnings.filterwarnings('ignore', message='.*invalid float value.*')
+warnings.filterwarnings('ignore', category=UserWarning, module='pdfplumber')
+warnings.filterwarnings('ignore', category=UserWarning, module='pdfminer')
 
 from rag.embeddings import embed_texts
 from rag.exceptions import IngestionError, EmbeddingError, StorageError
@@ -68,8 +75,11 @@ def get_file_metadata(file_path: str) -> Dict[str, Any]:
 
 def load_documents(folder_path: str) -> List[Document]:
     """Load documents from a folder using LlamaIndex readers."""
-    reader = SimpleDirectoryReader(input_dir=folder_path, recursive=True)
-    docs = reader.load_data()
+    # Suppress warnings during document loading (PDF processing can be noisy)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        reader = SimpleDirectoryReader(input_dir=folder_path, recursive=True)
+        docs = reader.load_data()
     return docs
 
 

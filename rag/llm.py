@@ -13,6 +13,102 @@ from rag.retry_utils import retry_with_backoff, is_retryable_error
 
 logger = logging.getLogger(__name__)
 
+# Token limits for different models
+# Rough estimate: 1 token ≈ 4 characters for Vietnamese/English mixed text
+# For safety, we'll use a conservative estimate
+TOKEN_ESTIMATE_CHARS = 3.5  # characters per token (conservative)
+MAX_TOKENS_LIMIT = 8000  # Maximum tokens for request body (including prompt, context, query, history)
+RESERVED_TOKENS = 2000  # Reserve tokens for system prompt, user query, instructions, and response buffer
+MAX_CONTEXT_TOKENS = MAX_TOKENS_LIMIT - RESERVED_TOKENS  # ~6000 tokens for context
+
+
+def estimate_tokens(text: str) -> int:
+    """
+    Rough estimate of token count from text.
+    Uses character count with a conservative ratio.
+    """
+    if not text:
+        return 0
+    return int(len(text) / TOKEN_ESTIMATE_CHARS)
+
+
+def truncate_chunks_to_fit(
+    chunks: List[str],
+    max_tokens: int,
+    query: str = "",
+    system_prompt: str = "",
+    conversation_history: Optional[List[dict]] = None,
+) -> List[str]:
+    """
+    Truncate chunks to fit within token limit.
+    Prioritizes earlier chunks (assumed to be more relevant after reranking).
+    
+    Args:
+        chunks: List of context chunks
+        max_tokens: Maximum tokens allowed for context
+        query: User query (for estimation)
+        system_prompt: System prompt (for estimation)
+        conversation_history: Conversation history (for estimation)
+    
+    Returns:
+        Truncated list of chunks that fit within token limit
+    """
+    # Estimate tokens for non-context parts
+    query_tokens = estimate_tokens(query)
+    system_tokens = estimate_tokens(system_prompt)
+    history_tokens = 0
+    if conversation_history:
+        for msg in conversation_history:
+            history_tokens += estimate_tokens(msg.get("content", ""))
+    
+    # Reserve tokens for instructions and formatting
+    instruction_tokens = 500  # Instructions added in user prompt
+    reserved = system_tokens + query_tokens + history_tokens + instruction_tokens
+    
+    # Available tokens for context
+    available_tokens = max_tokens - reserved
+    
+    if available_tokens <= 0:
+        logger.warning(f"Very little space for context: {available_tokens} tokens available")
+        return chunks[:1] if chunks else []  # Return at least first chunk
+    
+    # Try to fit as many chunks as possible
+    selected_chunks = []
+    total_tokens = 0
+    
+    for chunk in chunks:
+        chunk_tokens = estimate_tokens(chunk)
+        
+        # If adding this chunk would exceed limit, truncate it
+        if total_tokens + chunk_tokens > available_tokens:
+            # Try to truncate this chunk to fit
+            remaining_tokens = available_tokens - total_tokens
+            if remaining_tokens > 100:  # Only if we have meaningful space
+                # Truncate chunk: keep first part
+                max_chars = int(remaining_tokens * TOKEN_ESTIMATE_CHARS)
+                truncated = chunk[:max_chars]
+                if truncated:
+                    selected_chunks.append(truncated + "\n\n[... phần còn lại đã được cắt bớt để phù hợp với giới hạn ...]")
+                break
+            else:
+                # Not enough space, stop here
+                break
+        
+        selected_chunks.append(chunk)
+        total_tokens += chunk_tokens
+    
+    if not selected_chunks and chunks:
+        # If we couldn't fit anything, at least return a truncated first chunk
+        max_chars = int(available_tokens * TOKEN_ESTIMATE_CHARS)
+        selected_chunks.append(chunks[0][:max_chars] + "\n\n[... đã cắt bớt ...]")
+    
+    logger.info(
+        f"Truncated {len(chunks)} chunks to {len(selected_chunks)} chunks "
+        f"(estimated {total_tokens} tokens, limit: {available_tokens})"
+    )
+    
+    return selected_chunks
+
 
 def _get_client_and_model() -> tuple[ChatCompletionsClient, str]:
     """
@@ -93,15 +189,37 @@ def generate_answer(
             user_message="Không thể khởi tạo dịch vụ AI. Vui lòng kiểm tra cấu hình."
         ) from e
 
+    # Truncate chunks to fit within token limit
+    truncated_chunks = truncate_chunks_to_fit(
+        context_chunks,
+        max_tokens=MAX_TOKENS_LIMIT,
+        query=query,
+        system_prompt=SYSTEM_PROMPT,
+        conversation_history=conversation_history,
+    )
+    
+    if not truncated_chunks:
+        logger.warning("No chunks available after truncation")
+        return "Không thể xử lý context do quá dài. Vui lòng thử lại với câu hỏi cụ thể hơn."
+    
     # Handle long context: estimate token count and provide guidance
-    context_joined = "\n\n---\n\n".join(context_chunks)
+    context_joined = "\n\n---\n\n".join(truncated_chunks)
     context_length = len(context_joined)
+    original_chunk_count = len(context_chunks)
+    final_chunk_count = len(truncated_chunks)
     
     # Build user prompt with context-aware instructions
-    user_content_parts = [
-        f"Context (từ {len(context_chunks)} đoạn tài liệu):\n{context_joined}\n\n",
-        f"Câu hỏi: {query}\n\n"
-    ]
+    if original_chunk_count > final_chunk_count:
+        user_content_parts = [
+            f"Context (từ {final_chunk_count}/{original_chunk_count} đoạn tài liệu, "
+            f"đã được tối ưu để phù hợp với giới hạn):\n{context_joined}\n\n",
+        ]
+    else:
+        user_content_parts = [
+            f"Context (từ {final_chunk_count} đoạn tài liệu):\n{context_joined}\n\n",
+        ]
+    
+    user_content_parts.append(f"Câu hỏi: {query}\n\n")
     
     # Add context length guidance if context is very long
     if context_length > 10000:  # ~2500 tokens
@@ -251,6 +369,15 @@ def generate_answer(
     except Exception as e:
         duration_ms = (time.time() - start_time) * 1000
         
+        # Check if error is due to token limit
+        error_str = str(e).lower()
+        is_token_limit_error = (
+            "tokens_limit_reached" in error_str or
+            "request body too large" in error_str or
+            "token limit" in error_str or
+            "max size" in error_str
+        )
+        
         # Log failed API call
         log_api_call(
             service_name="LLM",
@@ -258,6 +385,70 @@ def generate_answer(
             duration_ms=duration_ms,
             error=e,
         )
+        
+        # If token limit error and we have chunks, try with fewer chunks
+        if is_token_limit_error and len(context_chunks) > 1:
+            logger.warning(
+                f"Token limit exceeded with {len(context_chunks)} chunks. "
+                f"Retrying with fewer chunks..."
+            )
+            try:
+                # Retry with only top 2-3 chunks, more aggressively truncated
+                reduced_chunks = truncate_chunks_to_fit(
+                    context_chunks[:3],  # Only top 3 chunks
+                    max_tokens=MAX_TOKENS_LIMIT - 1000,  # More conservative limit
+                    query=query,
+                    system_prompt=SYSTEM_PROMPT,
+                    conversation_history=conversation_history,
+                )
+                
+                if reduced_chunks:
+                    # Rebuild messages with reduced context
+                    context_joined = "\n\n---\n\n".join(reduced_chunks)
+                    user_content = (
+                        f"Context (từ {len(reduced_chunks)} đoạn tài liệu quan trọng nhất, "
+                        f"đã được tối ưu):\n{context_joined}\n\n"
+                        f"Câu hỏi: {query}\n\n"
+                        "Hãy trả lời dựa trên context trên. "
+                        "Nếu context không đủ để trả lời, hãy trả lời: 'Không tìm thấy trong tài liệu nội bộ.'"
+                    )
+                    
+                    # Rebuild messages
+                    retry_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                    if conversation_history:
+                        for hist_msg in conversation_history:
+                            if hist_msg.get("role") in ("user", "assistant"):
+                                retry_messages.append({
+                                    "role": hist_msg["role"],
+                                    "content": hist_msg["content"]
+                                })
+                    retry_messages.append({"role": "user", "content": user_content})
+                    
+                    # Retry with reduced context
+                    resp = _call_llm_api(client, model_name, retry_messages)
+                    duration_ms = (time.time() - start_time) * 1000
+                    
+                    choice = resp.choices[0]
+                    if choice and choice.message:
+                        content = choice.message.content
+                        if isinstance(content, str):
+                            logger.info("Successfully retried with reduced context")
+                            return content
+                        elif isinstance(content, list):
+                            text_parts = []
+                            for part in content:
+                                if hasattr(part, "text"):
+                                    text_parts.append(part.text)
+                                elif hasattr(part, "content"):
+                                    text_parts.append(part.content)
+                                elif isinstance(part, str):
+                                    text_parts.append(part)
+                            if text_parts:
+                                logger.info("Successfully retried with reduced context")
+                                return "".join(text_parts)
+            except Exception as retry_error:
+                logger.error(f"Retry with reduced context also failed: {retry_error}")
+                # Fall through to original error handling
         
         # Determine if error is retryable
         if is_retryable_error(e):
@@ -271,13 +462,24 @@ def generate_answer(
                 details={"error_type": type(e).__name__, "retryable": True}
             ) from e
         else:
-            raise LLMError(
-                f"LLM API call failed: {str(e)}",
-                user_message=(
-                    "Lỗi khi gọi dịch vụ AI. "
-                    "Vui lòng kiểm tra lại câu hỏi hoặc liên hệ quản trị viên nếu vấn đề tiếp tục."
-                ),
-                details={"error_type": type(e).__name__, "retryable": False}
-            ) from e
+            # Provide user-friendly message for token limit errors
+            if is_token_limit_error:
+                raise LLMError(
+                    f"LLM API call failed: {str(e)}",
+                    user_message=(
+                        "Câu hỏi hoặc tài liệu quá dài để xử lý. "
+                        "Vui lòng thử lại với câu hỏi cụ thể hơn hoặc chia nhỏ câu hỏi."
+                    ),
+                    details={"error_type": type(e).__name__, "retryable": False, "token_limit": True}
+                ) from e
+            else:
+                raise LLMError(
+                    f"LLM API call failed: {str(e)}",
+                    user_message=(
+                        "Lỗi khi gọi dịch vụ AI. "
+                        "Vui lòng kiểm tra lại câu hỏi hoặc liên hệ quản trị viên nếu vấn đề tiếp tục."
+                    ),
+                    details={"error_type": type(e).__name__, "retryable": False}
+                ) from e
 
 

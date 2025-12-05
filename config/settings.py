@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     github_token: Optional[str] = None  # env: GITHUB_TOKEN
     github_models_endpoint: str = "https://models.github.ai/inference"
     github_embedding_model: str = "openai/text-embedding-3-small"
-    github_chat_model: str = "gpt-4.1-mini"
+    github_chat_model: str = "openai/gpt-4.1-mini"
 
     # Cohere
     cohere_api_key: Optional[str] = None

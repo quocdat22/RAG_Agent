@@ -11,3 +11,8 @@ pydantic-settings
 httpx
 azure-ai-inference
 streamlit
+pdfplumber
+# Optional OCR dependencies (uncomment if needed for scanned PDFs):
+pdf2image
+pytesseract
+Pillow
