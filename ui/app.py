@@ -15,6 +15,7 @@ from rag.exceptions import RAGAgentException
 from rag.pipeline import answer_query
 from rag.vector_store import get_vector_store
 from storage.conversation_store import get_conversation_store
+from ui.state_manager import StateManager
 
 
 st.set_page_config(page_title="RAG Agent MVP", page_icon="💬", layout="wide")
@@ -38,28 +39,20 @@ def sidebar_conversations():
     
     store = get_conversation_store()
     
-    # Initialize session state
-    if "current_conversation_id" not in st.session_state:
-        st.session_state.current_conversation_id = None
-    if "use_history" not in st.session_state:
-        st.session_state.use_history = False
-    # Old conversation-specific document state is no longer needed for logic;
-    # retriever will use documents applied at chat time based on selected_documents.
-    
     # Create new conversation button
     if st.sidebar.button("➕ Cuộc trò chuyện mới", use_container_width=True):
         new_conv_id = store.create_conversation()
-        st.session_state.current_conversation_id = new_conv_id
-        st.session_state.messages = []
+        StateManager.set_current_conversation_id(new_conv_id)
+        StateManager.clear_messages()
         st.rerun()
     
     # Toggle for using conversation history
     use_history = st.sidebar.checkbox(
         "Sử dụng lịch sử cuộc trò chuyện",
-        value=st.session_state.use_history,
+        value=StateManager.get_use_history(),
         help="Bật để LLM nhớ các câu hỏi/trả lời trước đó trong cùng cuộc trò chuyện"
     )
-    st.session_state.use_history = use_history
+    StateManager.set_use_history(use_history)
     
     st.sidebar.divider()
     
@@ -86,21 +79,20 @@ def sidebar_conversations():
                         help=f"{message_count} tin nhắn"
                     )
                     if is_selected:
-                        st.session_state.current_conversation_id = conv_id
+                        StateManager.set_current_conversation_id(conv_id)
                         # Load messages for this conversation
                         messages = store.get_messages(conv_id)
-                        st.session_state.messages = [
+                        StateManager.set_messages([
                             {"role": msg["role"], "content": msg["content"]}
                             for msg in messages
-                        ]
+                        ])
                         st.rerun()
                 
                 with col2:
                     if st.button("🗑️", key=f"del_{conv_id}", help="Xóa"):
                         store.delete_conversation(conv_id)
-                        if st.session_state.current_conversation_id == conv_id:
-                            st.session_state.current_conversation_id = None
-                            st.session_state.messages = []
+                        if StateManager.get_current_conversation_id() == conv_id:
+                            StateManager.reset_conversation_state()
                         st.rerun()
         else:
             st.sidebar.info("Chưa có cuộc trò chuyện nào.")
@@ -123,12 +115,8 @@ def sidebar_ingestion():
                 folder = save_uploaded_files(uploaded_files)
                 count = run_ingestion(folder)
                 st.sidebar.success(f"Ingest xong {count} chunks từ thư mục tạm.")
-                # Clear cache to refresh document list
-                if hasattr(st.session_state, 'ingested_docs_cache'):
-                    del st.session_state.ingested_docs_cache
-                # Clear selected documents
-                if 'selected_documents' in st.session_state:
-                    st.session_state.selected_documents = []
+                # Reset document state after ingestion
+                StateManager.reset_document_state()
             except RAGAgentException as e:
                 st.sidebar.error(f"⚠️ {e.user_message}")
             except Exception as e:
@@ -141,66 +129,61 @@ def sidebar_ingestion():
     st.sidebar.divider()
     st.sidebar.subheader("📄 Tài liệu đã ingest")
     
-    # Initialize selected documents & helper flags in session state
-    if "selected_documents" not in st.session_state:
-        st.session_state.selected_documents = []
-    if "auto_select_docs_done" not in st.session_state:
-        st.session_state.auto_select_docs_done = False
-    # Initialize view_document
-    if "view_document" not in st.session_state:
-        st.session_state.view_document = None
-    
     try:
         # Cache the document list to avoid querying on every rerun
-        if 'ingested_docs_cache' not in st.session_state:
+        ingested_docs = StateManager.get_ingested_docs_cache()
+        if ingested_docs is None:
             vs = get_vector_store()
-            st.session_state.ingested_docs_cache = vs.get_all_documents()
-        
-        ingested_docs = st.session_state.ingested_docs_cache
+            ingested_docs = vs.get_all_documents()
+            StateManager.set_ingested_docs_cache(ingested_docs)
 
         # Clear view_document if the document no longer exists
-        if st.session_state.view_document:
+        view_doc = StateManager.get_view_document()
+        if view_doc:
             doc_keys = [doc.get("file_path") or doc.get("name", "Unknown") for doc in ingested_docs]
-            if st.session_state.view_document not in doc_keys:
-                st.session_state.view_document = None
+            if view_doc not in doc_keys:
+                StateManager.set_view_document(None)
         
         # Mặc định: nếu chưa chọn gì thì chọn tất cả tài liệu (chỉ 1 lần)
+        selected_docs = StateManager.get_selected_documents()
+        auto_done = StateManager.get_auto_select_docs_done()
         if (
             ingested_docs
-            and not st.session_state.selected_documents
-            and not st.session_state.auto_select_docs_done
+            and not selected_docs
+            and not auto_done
         ):
-            st.session_state.selected_documents = [
+            StateManager.set_selected_documents([
                 (doc.get("file_path") or doc.get("name", "Unknown"))
                 for doc in ingested_docs
-            ]
-            st.session_state.auto_select_docs_done = True
+            ])
+            StateManager.set_auto_select_docs_done(True)
         
         if ingested_docs:
+            selected_docs = StateManager.get_selected_documents()
             # Bulk actions section
-            if st.session_state.selected_documents:
+            if selected_docs:
                 col1, col2 = st.sidebar.columns(2)
                 with col1:
                     if st.button("📋 Xem chi tiết", use_container_width=True, key="view_selected"):
-                        st.session_state.view_document = st.session_state.selected_documents[0]
+                        StateManager.set_view_document(selected_docs[0])
                         st.rerun()
                 with col2:
                     if st.button("🗑️ Xóa đã chọn", use_container_width=True, key="delete_selected"):
-                        st.session_state.show_delete_confirm = True
-                        st.session_state.delete_targets = st.session_state.selected_documents.copy()
+                        StateManager.set_show_delete_confirm(True)
+                        StateManager.set_delete_targets(selected_docs.copy())
                         st.rerun()
             # Nút toggle chọn/bỏ chọn tất cả
             if ingested_docs:
-                if st.session_state.selected_documents:
+                if selected_docs:
                     # Đang chọn ít nhất 1 tài liệu -> cho phép bỏ chọn tất cả
                     if st.sidebar.button(
                         "🧹 Bỏ chọn tất cả",
                         use_container_width=True,
                         key="clear_selected_docs",
                     ):
-                        st.session_state.selected_documents = []
+                        StateManager.clear_selected_documents()
                         # Đánh dấu đã tùy chỉnh, không auto-select lại
-                        st.session_state.auto_select_docs_done = True
+                        StateManager.set_auto_select_docs_done(True)
                         st.rerun()
                 else:
                     # Không có tài liệu nào được chọn -> cho phép chọn tất cả
@@ -209,17 +192,17 @@ def sidebar_ingestion():
                         use_container_width=True,
                         key="select_all_docs",
                     ):
-                        st.session_state.selected_documents = [
+                        StateManager.set_selected_documents([
                             (doc.get("file_path") or doc.get("name", "Unknown"))
                             for doc in ingested_docs
-                        ]
-                        st.session_state.auto_select_docs_done = True
+                        ])
+                        StateManager.set_auto_select_docs_done(True)
                         st.rerun()
             
             # Delete confirmation dialog
-            if st.session_state.get('show_delete_confirm', False):
+            if StateManager.get_show_delete_confirm():
                 st.sidebar.warning("⚠️ Xác nhận xóa")
-                targets = st.session_state.get('delete_targets', [])
+                targets = StateManager.get_delete_targets()
                 for target in targets:
                     st.sidebar.text(f"• {target}")
                 col1, col2 = st.sidebar.columns(2)
@@ -231,17 +214,12 @@ def sidebar_ingestion():
                             count = vs.delete_document(file_path)
                             deleted_count += count
                         st.sidebar.success(f"Đã xóa {deleted_count} chunks từ {len(targets)} tài liệu.")
-                        # Clear cache and selection
-                        if 'ingested_docs_cache' in st.session_state:
-                            del st.session_state.ingested_docs_cache
-                        st.session_state.selected_documents = []
-                        st.session_state.show_delete_confirm = False
-                        st.session_state.delete_targets = []
+                        # Reset document state after deletion
+                        StateManager.reset_document_state()
                         st.rerun()
                 with col2:
                     if st.button("❌ Hủy", use_container_width=True, key="cancel_delete"):
-                        st.session_state.show_delete_confirm = False
-                        st.session_state.delete_targets = []
+                        StateManager.clear_delete_confirm()
                         st.rerun()
             
             st.sidebar.divider()
@@ -258,7 +236,7 @@ def sidebar_ingestion():
                 # Checkbox for selection - Streamlit automatically handles rerun on change
                 is_selected = st.sidebar.checkbox(
                     f"📄 {doc_name}",
-                    value=doc_key in st.session_state.selected_documents,
+                    value=StateManager.is_document_selected(doc_key),
                     key=f"doc_checkbox_{idx}",
                     help=f"{chunk_count} chunks"
                 )
@@ -266,26 +244,24 @@ def sidebar_ingestion():
                 # Update selection based on checkbox state
                 # This runs after Streamlit reruns due to checkbox change
                 if is_selected:
-                    if doc_key not in st.session_state.selected_documents:
-                        st.session_state.selected_documents.append(doc_key)
+                    StateManager.add_selected_document(doc_key)
                 else:
-                    if doc_key in st.session_state.selected_documents:
-                        st.session_state.selected_documents.remove(doc_key)
+                    StateManager.remove_selected_document(doc_key)
                 # Người dùng đã tương tác lựa chọn thủ công
-                st.session_state.auto_select_docs_done = True
+                StateManager.set_auto_select_docs_done(True)
                 
                 # Action buttons for each document
                 col1, col2, col3 = st.sidebar.columns([2, 2, 1])
                 
                 with col1:
                     if st.button("Chi tiết", key=f"view_{idx}", use_container_width=True):
-                        st.session_state.view_document = doc_key
+                        StateManager.set_view_document(doc_key)
                         st.rerun()
                 
                 with col2:
                     if st.button("🗑️ Xóa", key=f"delete_{idx}", use_container_width=True):
-                        st.session_state.show_delete_confirm = True
-                        st.session_state.delete_targets = [doc_key]
+                        StateManager.set_show_delete_confirm(True)
+                        StateManager.set_delete_targets([doc_key])
                         st.rerun()
                 
                 with col3:
@@ -303,13 +279,14 @@ def sidebar_ingestion():
         )
     
     # View document details modal/expander
-    if st.session_state.get('view_document'):
+    view_doc = StateManager.get_view_document()
+    if view_doc:
         st.sidebar.divider()
         st.sidebar.subheader("📋 Chi tiết tài liệu")
         
         try:
             vs = get_vector_store()
-            chunks = vs.get_document_chunks(st.session_state.view_document)
+            chunks = vs.get_document_chunks(view_doc)
             
             if chunks:
                 st.sidebar.write(f"**Tổng số chunks:** {len(chunks)}")
@@ -333,7 +310,7 @@ def sidebar_ingestion():
                 st.sidebar.warning("Không tìm thấy chunks cho tài liệu này.")
             
             if st.sidebar.button("✖️ Đóng", key="close_view"):
-                st.session_state.view_document = None
+                StateManager.set_view_document(None)
                 st.rerun()
         except Exception as e:
             st.sidebar.error(
@@ -341,7 +318,7 @@ def sidebar_ingestion():
                 "Vui lòng thử lại sau."
             )
             if st.sidebar.button("✖️ Đóng", key="close_view_error"):
-                st.session_state.view_document = None
+                StateManager.set_view_document(None)
                 st.rerun()
 
 
@@ -351,22 +328,16 @@ def main_chat():
 
     store = get_conversation_store()
     
-    # Initialize messages
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    
-    # Initialize conversation if needed
-    if "current_conversation_id" not in st.session_state:
-        st.session_state.current_conversation_id = None
-    
     # Display current conversation info
-    if st.session_state.current_conversation_id:
-        conv = store.get_conversation(st.session_state.current_conversation_id)
+    conversation_id = StateManager.get_current_conversation_id()
+    if conversation_id:
+        conv = store.get_conversation(conversation_id)
         if conv:
             st.caption(f"📝 {conv['title']}")
 
     # Display messages
-    for msg in st.session_state.messages:
+    messages = StateManager.get_messages()
+    for msg in messages:
         role = "user" if msg["role"] == "user" else "assistant"
         with st.chat_message(role):
             st.markdown(msg["content"])
@@ -379,18 +350,18 @@ def main_chat():
     user_input = st.chat_input("Nhập câu hỏi về tài liệu nội bộ...")
     if user_input:
         # Ensure we have a conversation
-        conversation_id = st.session_state.current_conversation_id
+        conversation_id = StateManager.get_current_conversation_id()
         if not conversation_id:
             conversation_id = store.create_conversation()
-            st.session_state.current_conversation_id = conversation_id
+            StateManager.set_current_conversation_id(conversation_id)
 
         # Tự động áp dụng các tài liệu đang được chọn cho cuộc trò chuyện hiện tại
-        selected_docs = st.session_state.get("selected_documents", [])
+        selected_docs = StateManager.get_selected_documents()
         # Lưu vào DB để retriever giới hạn theo tài liệu đã chọn
         store.update_selected_documents(conversation_id, selected_docs or [])
 
-        # Add user message to session state
-        st.session_state.messages.append({"role": "user", "content": user_input})
+        # Add user message to state
+        StateManager.append_message({"role": "user", "content": user_input})
         
         # Save user message to DB
         store.add_message(
@@ -408,13 +379,13 @@ def main_chat():
                     result = answer_query(
                         user_input,
                         conversation_id=conversation_id,
-                        use_history=st.session_state.use_history,
+                        use_history=StateManager.get_use_history(),
                     )
                 except RAGAgentException as e:
                     # Use user-friendly message from custom exception
                     error_msg = e.user_message
                     st.error(f"⚠️ {error_msg}")
-                    st.session_state.messages.append(
+                    StateManager.append_message(
                         {"role": "assistant", "content": f"⚠️ {error_msg}"}
                     )
                     # Save error message to DB
@@ -435,7 +406,7 @@ def main_chat():
                         "Vui lòng thử lại sau hoặc liên hệ quản trị viên nếu vấn đề tiếp tục."
                     )
                     st.error(f"⚠️ {error_msg}")
-                    st.session_state.messages.append(
+                    StateManager.append_message(
                         {"role": "assistant", "content": f"⚠️ {error_msg}"}
                     )
                     # Save error message to DB
@@ -462,13 +433,13 @@ def main_chat():
                     for i, src in enumerate(result.sources, start=1):
                         st.write(f"{i}. {src}")
 
-        # Add assistant message to session state
+        # Add assistant message to state
         assistant_msg = {
             "role": "assistant",
             "content": result.answer,
             "sources": result.sources,
         }
-        st.session_state.messages.append(assistant_msg)
+        StateManager.append_message(assistant_msg)
         
         # Save assistant message to DB
         store.add_message(
@@ -480,6 +451,9 @@ def main_chat():
 
 
 def main():
+    # Initialize all state at the start
+    StateManager.initialize()
+    
     sidebar_conversations()
     sidebar_ingestion()
     main_chat()
