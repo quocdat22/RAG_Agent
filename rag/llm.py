@@ -93,21 +93,57 @@ def generate_answer(
             user_message="Không thể khởi tạo dịch vụ AI. Vui lòng kiểm tra cấu hình."
         ) from e
 
+    # Handle long context: estimate token count and provide guidance
     context_joined = "\n\n---\n\n".join(context_chunks)
-    user_content = (
-        f"Context:\n{context_joined}\n\n"
+    context_length = len(context_joined)
+    
+    # Build user prompt with context-aware instructions
+    user_content_parts = [
+        f"Context (từ {len(context_chunks)} đoạn tài liệu):\n{context_joined}\n\n",
         f"Câu hỏi: {query}\n\n"
-        "Chỉ trả lời dựa trên context. Nếu context không đủ, trả lời: "
-        "'Không tìm thấy trong tài liệu nội bộ.'\n\n"
-        "LƯU Ý QUAN TRỌNG:\n"
-        "- Nếu context chứa dữ liệu dạng bảng (số liệu, thống kê có nhiều cột và hàng), "
-        "hãy trình bày lại dưới dạng markdown table với format:\n"
-        "| Tiêu đề cột 1 | Tiêu đề cột 2 | Tiêu đề cột 3 |\n"
-        "|----------------|----------------|----------------|\n"
-        "| Dữ liệu 1      | Dữ liệu 2      | Dữ liệu 3      |\n"
-        "- Giữ nguyên số liệu, không làm tròn trừ khi được yêu cầu.\n"
-        "- Nếu có nhiều bảng, trình bày từng bảng một cách rõ ràng."
+    ]
+    
+    # Add context length guidance if context is very long
+    if context_length > 10000:  # ~2500 tokens
+        user_content_parts.append(
+            "LƯU Ý: Context khá dài. Hãy tập trung vào thông tin liên quan trực tiếp đến câu hỏi. "
+            "Nếu cần tóm tắt, hãy giữ lại các số liệu và thông tin quan trọng nhất.\n\n"
+        )
+    
+    # Add specific instructions based on query type
+    query_lower = query.lower()
+    has_table_keywords = any(kw in query_lower for kw in ['bảng', 'table', 'số liệu', 'thống kê', 'doanh thu', 'chi phí', 'danh sách'])
+    has_list_keywords = any(kw in query_lower for kw in ['danh sách', 'list', 'các bước', 'quy trình', 'những gì'])
+    
+    if has_table_keywords:
+        user_content_parts.append(
+            "CÂU HỎI LIÊN QUAN ĐẾN BẢNG/SỐ LIỆU:\n"
+            "- Nếu context chứa dữ liệu dạng bảng, hãy trình bày lại dưới dạng markdown table\n"
+            "- Giữ nguyên số liệu chính xác, không làm tròn\n"
+            "- Đặt tiêu đề rõ ràng cho bảng\n\n"
+        )
+    
+    if has_list_keywords:
+        user_content_parts.append(
+            "CÂU HỎI LIÊN QUAN ĐẾN DANH SÁCH:\n"
+            "- Trình bày dưới dạng danh sách có thứ tự (1., 2., 3.) hoặc bullet points (-)\n"
+            "- Mỗi item nên ngắn gọn, rõ ràng\n\n"
+        )
+    
+    # Add conflict detection instruction
+    user_content_parts.append(
+        "XỬ LÝ ĐẶC BIỆT:\n"
+        "- Nếu phát hiện thông tin mâu thuẫn trong context, hãy trình bày cả hai và ghi chú về sự khác biệt\n"
+        "- Nếu thông tin không đầy đủ, hãy trả lời phần có thể và ghi chú phần còn thiếu\n"
+        "- Nếu có nhiều nguồn thông tin, hãy tổng hợp một cách logic\n\n"
     )
+    
+    user_content_parts.append(
+        "Hãy trả lời dựa trên context trên. Nếu context không đủ để trả lời, "
+        "hãy trả lời: 'Không tìm thấy trong tài liệu nội bộ.'"
+    )
+    
+    user_content = "".join(user_content_parts)
 
     # Build messages array with conversation history if provided
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
