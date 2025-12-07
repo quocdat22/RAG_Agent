@@ -119,16 +119,21 @@ def validate_file_type(file) -> bool:
     return False
 
 
+# Define persistent document directory
+DOCUMENTS_DIR = ROOT_DIR / "data" / "documents"
+DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def save_uploaded_files(files) -> str:
     """
-    Save uploaded files into a temporary directory and return its path.
+    Save uploaded files into the persistent documents directory and return its path.
     Validates MIME types before saving.
     
     Args:
         files: List of Streamlit UploadedFile objects
     
     Returns:
-        Path to temporary directory containing saved files
+        Path to the documents directory containing saved files
     
     Raises:
         ValueError: If any file has an invalid MIME type
@@ -148,13 +153,13 @@ def save_uploaded_files(files) -> str:
             f"Allowed types: PDF, DOC, DOCX, XLS, XLSX, PPT, PPTX, TXT, HTML, MD, CSV, and common image formats."
         )
     
-    # All files are valid, save them
-    tmp_dir = Path(tempfile.mkdtemp(prefix="rag_uploads_"))
+    # All files are valid, save them to the persistent directory
     for f in files:
-        out_path = tmp_dir / f.name
+        out_path = DOCUMENTS_DIR / f.name
         with out_path.open("wb") as out_f:
             out_f.write(f.read())
-    return str(tmp_dir)
+            
+    return str(DOCUMENTS_DIR)
 
 
 def sidebar_conversations():
@@ -238,7 +243,7 @@ def sidebar_ingestion():
             try:
                 folder = save_uploaded_files(uploaded_files)
                 count = run_ingestion(folder)
-                st.sidebar.success(f"Ingest xong {count} chunks từ thư mục tạm.")
+                st.sidebar.success(f"Ingest xong {count} chunks từ thư mục documents.")
                 # Reset document state after ingestion
                 StateManager.reset_document_state()
             except ValueError as e:
@@ -271,60 +276,11 @@ def sidebar_ingestion():
             if view_doc not in doc_keys:
                 StateManager.set_view_document(None)
         
-        # Mặc định: nếu chưa chọn gì thì chọn tất cả tài liệu (chỉ 1 lần)
-        selected_docs = StateManager.get_selected_documents()
-        auto_done = StateManager.get_auto_select_docs_done()
-        if (
-            ingested_docs
-            and not selected_docs
-            and not auto_done
-        ):
-            StateManager.set_selected_documents([
-                (doc.get("file_path") or doc.get("name", "Unknown"))
-                for doc in ingested_docs
-            ])
-            StateManager.set_auto_select_docs_done(True)
+
         
         if ingested_docs:
-            selected_docs = StateManager.get_selected_documents()
-            # Bulk actions section
-            if selected_docs:
-                col1, col2 = st.sidebar.columns(2)
-                with col1:
-                    if st.button("📋 Xem chi tiết", use_container_width=True, key="view_selected"):
-                        StateManager.set_view_document(selected_docs[0])
-                        st.rerun()
-                with col2:
-                    if st.button("🗑️ Xóa đã chọn", use_container_width=True, key="delete_selected"):
-                        StateManager.set_show_delete_confirm(True)
-                        StateManager.set_delete_targets(selected_docs.copy())
-                        st.rerun()
-            # Nút toggle chọn/bỏ chọn tất cả
-            if ingested_docs:
-                if selected_docs:
-                    # Đang chọn ít nhất 1 tài liệu -> cho phép bỏ chọn tất cả
-                    if st.sidebar.button(
-                        "🧹 Bỏ chọn tất cả",
-                        use_container_width=True,
-                        key="clear_selected_docs",
-                    ):
-                        StateManager.clear_selected_documents()
-                        # Đánh dấu đã tùy chỉnh, không auto-select lại
-                        StateManager.set_auto_select_docs_done(True)
-                        st.rerun()
-                else:
-                    # Không có tài liệu nào được chọn -> cho phép chọn tất cả
-                    if st.sidebar.button(
-                        "✅ Chọn tất cả",
-                        use_container_width=True,
-                        key="select_all_docs",
-                    ):
-                        StateManager.set_selected_documents([
-                            (doc.get("file_path") or doc.get("name", "Unknown"))
-                            for doc in ingested_docs
-                        ])
-                        StateManager.set_auto_select_docs_done(True)
-                        st.rerun()
+            # Removed bulk actions (selection)
+            pass
             
             # Delete confirmation dialog
             if StateManager.get_show_delete_confirm():
@@ -340,6 +296,23 @@ def sidebar_ingestion():
                         for file_path in targets:
                             count = vs.delete_document(file_path)
                             deleted_count += count
+                            
+                            # Also delete physical file if it exists in the documents directory
+                            try:
+                                # target/file_path might be absolute or relative
+                                # Check if it's inside DOCUMENTS_DIR or just a filename
+                                p = Path(file_path)
+                                if p.is_absolute():
+                                    if p.exists():
+                                        os.remove(p)
+                                else:
+                                    # Try resolving relative to DOCUMENTS_DIR
+                                    p = DOCUMENTS_DIR / file_path
+                                    if p.exists():
+                                        os.remove(p)
+                            except Exception as e:
+                                st.sidebar.warning(f"Không thể xóa file vật lý: {file_path}")
+                                
                         st.sidebar.success(f"Đã xóa {deleted_count} chunks từ {len(targets)} tài liệu.")
                         # Reset document state after deletion
                         StateManager.reset_document_state()
@@ -360,22 +333,9 @@ def sidebar_ingestion():
                 # Use file_path as the key for selection
                 doc_key = file_path or doc_name
                 
-                # Checkbox for selection - Streamlit automatically handles rerun on change
-                is_selected = st.sidebar.checkbox(
-                    f"📄 {doc_name}",
-                    value=StateManager.is_document_selected(doc_key),
-                    key=f"doc_checkbox_{idx}",
-                    help=f"{chunk_count} chunks"
-                )
-                
-                # Update selection based on checkbox state
-                # This runs after Streamlit reruns due to checkbox change
-                if is_selected:
-                    StateManager.add_selected_document(doc_key)
-                else:
-                    StateManager.remove_selected_document(doc_key)
-                # Người dùng đã tương tác lựa chọn thủ công
-                StateManager.set_auto_select_docs_done(True)
+                # Display document name without checkbox
+                st.sidebar.markdown(f"**📄 {doc_name}**")
+
                 
                 # Action buttons for each document
                 col1, col2, col3 = st.sidebar.columns([2, 2, 1])
@@ -482,10 +442,8 @@ def main_chat():
             conversation_id = store.create_conversation()
             StateManager.set_current_conversation_id(conversation_id)
 
-        # Tự động áp dụng các tài liệu đang được chọn cho cuộc trò chuyện hiện tại
-        selected_docs = StateManager.get_selected_documents()
-        # Lưu vào DB để retriever giới hạn theo tài liệu đã chọn
-        store.update_selected_documents(conversation_id, selected_docs or [])
+        # Luôn sử dụng tất cả tài liệu (xóa logic chọn tài liệu)
+        store.update_selected_documents(conversation_id, [])
 
         # Add user message to state
         StateManager.append_message({"role": "user", "content": user_input})
