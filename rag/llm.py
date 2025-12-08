@@ -1,5 +1,6 @@
 import logging
 import time
+import base64
 from typing import List, Optional
 
 from azure.ai.inference import ChatCompletionsClient
@@ -160,6 +161,84 @@ def _call_llm_api(client: ChatCompletionsClient, model_name: str, messages: List
         model=model_name,
         messages=messages,
     )
+
+
+def generate_image_description(image_data: bytes, prompt: str = "Describe this chart or image in detail for data analysis purposes.") -> str:
+    """
+    Generate description for an image using Vision LLM.
+    
+    Args:
+        image_data: Raw image bytes
+        prompt: Prompt for the description
+        
+    Returns:
+        Description string
+    """
+    settings = get_settings()
+    if not settings.enable_chart_description:
+        return ""
+        
+    try:
+        # Get vision model
+        model_name = settings.github_vision_model
+        
+        # Initialize client (same as chat for now, assuming same endpoint/auth)
+        if settings.github_token:
+            client = ChatCompletionsClient(
+                endpoint=settings.github_models_endpoint,
+                credential=AzureKeyCredential(settings.github_token),
+            )
+        elif settings.azure_openai_endpoint and settings.azure_openai_api_key:
+             # Fallback to Azure if configured (might need specific deployment for vision)
+             # For now assume user configured vision model as main chat model or we use what's available
+             client = ChatCompletionsClient(
+                endpoint=settings.azure_openai_endpoint,
+                credential=AzureKeyCredential(settings.azure_openai_api_key),
+            )
+             if settings.azure_openai_chat_deployment:
+                 model_name = settings.azure_openai_chat_deployment
+        else:
+            logger.warning("No AI service configured for vision.")
+            return ""
+
+        # Encode image to base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        image_url = f"data:image/jpeg;base64,{image_base64}"
+        
+        # Prepare message with image
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a data analyst helper. Your job is to describe charts and images in documents so that text-only models can understand the data. Be precise with numbers and trends."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url,
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        # Call API
+        resp = _call_llm_api(client, model_name, messages)
+        
+        if resp and resp.choices and resp.choices[0].message:
+            return resp.choices[0].message.content or ""
+            
+    except Exception as e:
+        logger.warning(f"Failed to generate image description: {e}")
+        
+    return ""
 
 
 def generate_answer(

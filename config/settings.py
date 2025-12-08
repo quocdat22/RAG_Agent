@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     github_models_endpoint: str = "https://models.github.ai/inference"
     github_embedding_model: str = "openai/text-embedding-3-small"
     github_chat_model: str = "openai/gpt-4.1-mini"
+    github_vision_model: str = "openai/gpt-4o"
+
+    # Vision features
+    enable_chart_description: bool = True
 
     # Cohere
     cohere_api_key: Optional[str] = None

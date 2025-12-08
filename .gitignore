@@ -11,3 +11,6 @@ wheels/
 data/
 .env
 MVP.md
+notebooks/
+bin/
+lib/

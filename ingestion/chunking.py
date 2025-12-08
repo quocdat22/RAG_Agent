@@ -7,6 +7,7 @@ import os
 import re
 import warnings
 from typing import List, Dict, Any, Optional
+import io
 from pathlib import Path
 
 from llama_index.core import Document
@@ -18,6 +19,7 @@ from llama_index.core.node_parser import (
 from llama_index.core.schema import BaseNode, TextNode
 
 from ingestion.metadata_schema import normalize_metadata, get_file_path, MetadataFields
+from rag.llm import generate_image_description
 
 logger = logging.getLogger(__name__)
 
@@ -486,6 +488,88 @@ def extract_tables_with_ocr(file_path: str) -> Dict[int, List[Dict[str, Any]]]:
     return extract_tables_from_pdf(file_path)
 
 
+def extract_chart_descriptions_from_pdf(file_path: str) -> Dict[int, str]:
+    """
+    Extract descriptions of charts/images from PDF using Vision LLM.
+    Returns a dictionary mapping page numbers to descriptions.
+    """
+    if not OCR_AVAILABLE:
+        return {}
+        
+    descriptions = {}
+    
+    try:
+        # Check if we should process this file (heuristics using pdfplumber if available)
+        pages_to_process = []
+        if PDFPLUMBER_AVAILABLE:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with pdfplumber.open(file_path) as pdf:
+                    for i, page in enumerate(pdf.pages):
+                        # Simple heuristic: if page has images/figures
+                        # Filter out small images (logos, icons)
+                        has_significant_images = False
+                        if hasattr(page, 'images') and page.images:
+                            for img in page.images:
+                                # Check dimensions (arbitrary threshold like 100x100)
+                                w = float(img.get('width', 0))
+                                h = float(img.get('height', 0))
+                                if w > 100 and h > 100:
+                                    has_significant_images = True
+                                    break
+                        
+                        if has_significant_images:
+                            pages_to_process.append(i + 1) # 1-based index
+        else:
+            # If pdfplumber not available, maybe process all pages? or first few?
+            # Safe default: skip to avoid processing everything
+            logger.warning("pdfplumber not available, skipping intelligent chart detection")
+            return {}
+            
+        if not pages_to_process:
+            return {}
+            
+        logger.info(f"Detected potential charts on pages {pages_to_process} of {file_path}")
+        
+        # Convert specific pages to images
+        # pdf2image allows converting specific pages
+        for page_num in pages_to_process:
+            try:
+                # Convert single page
+                images = convert_from_path(
+                    file_path, 
+                    first_page=page_num, 
+                    last_page=page_num,
+                    fmt='jpeg'
+                )
+                
+                if images:
+                    img = images[0]
+                    # Convert to bytes
+                    img_byte_arr = io.BytesIO()
+                    img.save(img_byte_arr, format='JPEG')
+                    img_bytes = img_byte_arr.getvalue()
+                    
+                    # Generate description
+                    description = generate_image_description(
+                        img_bytes,
+                        prompt="Describe any charts, graphs, or data visualizations on this page. If there are no charts or significant data visualizations, return 'NO_CHART' only. If there are, provide a detailed description of the data, trends, and labels."
+                    )
+                    
+                    if description and "NO_CHART" not in description:
+                        # Format the description
+                        formatted_desc = f"\n\n[MÔ TẢ BIỂU ĐỒ/HÌNH ẢNH TRANG {page_num}]:\n{description}\n"
+                        descriptions[page_num] = formatted_desc
+                        logger.info(f"Generated chart description for page {page_num}")
+            except Exception as e:
+                logger.warning(f"Error processing page {page_num} for chart description: {e}")
+                
+    except Exception as e:
+        logger.warning(f"Failed to extract chart descriptions: {e}")
+        
+    return descriptions
+
+
 def chunk_pdf_document(document: Document) -> List[BaseNode]:
     """
     Chunk PDF documents with special handling for tables and images.
@@ -499,12 +583,20 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
     
     # Try to extract tables from PDF if file path is available
     extracted_tables = {}
-    if file_path and os.path.exists(file_path) and PDFPLUMBER_AVAILABLE:
-        try:
-            extracted_tables = extract_tables_from_pdf(file_path)
-            logger.info(f"Extracted {sum(len(t) for t in extracted_tables.values())} tables from PDF")
-        except Exception as e:
-            logger.warning(f"Failed to extract tables from PDF: {e}")
+    extracted_charts = {}
+    if file_path and os.path.exists(file_path):
+        if PDFPLUMBER_AVAILABLE:
+            try:
+                extracted_tables = extract_tables_from_pdf(file_path)
+                logger.info(f"Extracted {sum(len(t) for t in extracted_tables.values())} tables from PDF")
+            except Exception as e:
+                logger.warning(f"Failed to extract tables from PDF: {e}")
+            
+            # Extract chart descriptions
+            try:
+                extracted_charts = extract_chart_descriptions_from_pdf(file_path)
+            except Exception as e:
+                logger.warning(f"Failed to extract chart descriptions: {e}")
     
     # Detect if content has tables (common in PDFs)
     has_tables = (
@@ -530,6 +622,8 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
     
     # Post-process: detect and preserve tables
     processed_nodes = []
+    features_injected_pages = set() # Track pages where we injected features
+    
     for node in nodes:
         node_content = node.get_content()
         
@@ -542,6 +636,21 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
             except (ValueError, TypeError):
                 pass
         
+        # Inject chart descriptions (only once per page)
+        if page_num and page_num in extracted_charts:
+            if page_num not in features_injected_pages:
+                desc = extracted_charts[page_num]
+                if not node_content.endswith('\n'):
+                    node_content += '\n'
+                node_content += desc
+                node.set_content(node_content)
+                # Mark as injected (we use a separate set for charts to ensure we don't interfere with tables logic, 
+                # although reusing features_injected_pages for both might be cleaner if we wanted to group them)
+                # But here I'll just use a set for "chart injected" logic implicitly? 
+                # Actually, let's just use a specific set for charts if I want to be precise, 
+                # but "features_injected_pages" is fine if I define what "features" means.
+                # However, tables are injected below based on page_num match.
+                
         # If we have extracted tables for this page, enhance content with them
         if page_num and page_num in extracted_tables:
             # Check if content already has tables
@@ -558,6 +667,10 @@ def chunk_pdf_document(document: Document) -> List[BaseNode]:
                     node_content = enhanced_content
                     node.set_content(enhanced_content)
         
+        # Mark page as having features injected (charts handled above)
+        if page_num and page_num in extracted_charts:
+             features_injected_pages.add(page_num)
+
         # Try to detect and format tables in text
         formatted_content = format_tables_in_text(node_content)
         if formatted_content != node_content:
